@@ -16,6 +16,7 @@ package com.google.devtools.build.lib.analysis.actions;
 
 import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Preconditions.checkNotNull;
+import static com.google.common.base.Preconditions.checkState;
 import static com.google.common.collect.ImmutableSet.toImmutableSet;
 import static com.google.devtools.build.lib.actions.ActionAnalysisMetadata.mergeMaps;
 import static com.google.devtools.build.lib.packages.ExecGroup.DEFAULT_EXEC_GROUP_NAME;
@@ -321,8 +322,26 @@ public class SpawnAction extends AbstractAction implements CommandAction {
   public Spawn getSpawn(ActionExecutionContext actionExecutionContext)
       throws CommandLineExpansionException, InterruptedException {
     return getSpawn(
-        actionExecutionContext,
+        actionExecutionContext.getArtifactExpander(),
+        actionExecutionContext.getTopLevelFilesets(),
         actionExecutionContext.getClientEnv(),
+        /* envResolved= */ false,
+        /* reportOutputs= */ true);
+  }
+
+  /**
+   * Returns the spawn used to compute this action's remote key without executing the action.
+   *
+   * <p>This initial API intentionally excludes input-discovering actions and top-level filesets.
+   */
+  public final Spawn getSpawnForActionKey(
+      Map<String, String> clientEnv, ArtifactExpander artifactExpander)
+      throws CommandLineExpansionException, InterruptedException {
+    checkState(!discoversInputs(), "input-discovering action is unsupported: %s", this);
+    return getSpawn(
+        artifactExpander,
+        ImmutableMap.of(),
+        clientEnv,
         /* envResolved= */ false,
         /* reportOutputs= */ true);
   }
@@ -341,11 +360,26 @@ public class SpawnAction extends AbstractAction implements CommandAction {
       boolean envResolved,
       boolean reportOutputs)
       throws CommandLineExpansionException, InterruptedException {
+    return getSpawn(
+        actionExecutionContext.getArtifactExpander(),
+        actionExecutionContext.getTopLevelFilesets(),
+        env,
+        envResolved,
+        reportOutputs);
+  }
+
+  private Spawn getSpawn(
+      ArtifactExpander artifactExpander,
+      ImmutableMap<Artifact, FilesetOutputTree> topLevelFilesets,
+      Map<String, String> env,
+      boolean envResolved,
+      boolean reportOutputs)
+      throws CommandLineExpansionException, InterruptedException {
     PathMapper pathMapper =
         PathMappers.create(this, outputPathsMode, this instanceof StarlarkAction);
     ExpandedCommandLines expandedCommandLines =
         commandLines.expand(
-            actionExecutionContext.getArtifactExpander(),
+            artifactExpander,
             getPrimaryOutput().getExecPath(),
             pathMapper,
             getCommandLineLimits());
@@ -356,7 +390,7 @@ public class SpawnAction extends AbstractAction implements CommandAction {
         envResolved,
         getInputs(),
         expandedCommandLines.getParamFiles(),
-        actionExecutionContext.getTopLevelFilesets(),
+        topLevelFilesets,
         reportOutputs,
         pathMapper);
   }

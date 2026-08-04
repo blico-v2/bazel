@@ -697,6 +697,10 @@ public class RemoteExecutionService {
     }
   }
 
+  DigestUtil getDigestUtilForProducerKeyedTestCache() {
+    return digestUtil;
+  }
+
   @Nullable
   private ToolSignature computePersistentWorkerSignature(Spawn spawn, SpawnExecutionContext context)
       throws IOException, ExecException, InterruptedException {

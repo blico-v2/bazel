@@ -14,6 +14,7 @@
 
 package com.google.devtools.build.lib.analysis.test;
 
+import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Iterables;
@@ -36,6 +37,7 @@ import com.google.devtools.build.lib.packages.TestTimeout;
 import com.google.devtools.build.lib.util.Pair;
 import com.google.devtools.build.lib.util.RegexFilter;
 import com.google.devtools.common.options.BoolOrEnumConverter;
+import com.google.devtools.common.options.Converters.CommaSeparatedOptionSetConverter;
 import com.google.devtools.common.options.Option;
 import com.google.devtools.common.options.OptionDefinition;
 import com.google.devtools.common.options.OptionDocumentationCategory;
@@ -85,6 +87,36 @@ public class TestConfiguration extends Fragment {
             OptionsParser.getOptionDefinitionByName(TestOptions.class, "trim_test_configuration"),
             OptionsParser.getOptionDefinitionByName(
                 TestOptions.class, "experimental_retain_test_configuration_across_testonly"));
+
+    @Option(
+        name = "experimental_producer_keyed_test_cache",
+        defaultValue = "false",
+        documentationCategory = OptionDocumentationCategory.UNDOCUMENTED,
+        effectTags = {OptionEffectTag.EXECUTION},
+        metadataTags = {OptionMetadataTag.EXPERIMENTAL},
+        help =
+            "Compute producer-keyed test cache identities before requesting test executables. "
+                + "This feasibility mode does not read or write cache entries.")
+    public boolean experimentalProducerKeyedTestCache;
+
+    @Option(
+        name = "experimental_producer_keyed_test_cache_producer_mnemonics",
+        defaultValue = "GoLink",
+        converter = CommaSeparatedOptionSetConverter.class,
+        documentationCategory = OptionDocumentationCategory.UNDOCUMENTED,
+        effectTags = {OptionEffectTag.EXECUTION},
+        metadataTags = {OptionMetadataTag.EXPERIMENTAL},
+        help = "Producer action mnemonics eligible for producer-keyed test cache computation.")
+    public ImmutableList<String> experimentalProducerKeyedTestCacheProducerMnemonics;
+
+    @Option(
+        name = "experimental_producer_keyed_test_cache_debug",
+        defaultValue = "false",
+        documentationCategory = OptionDocumentationCategory.UNDOCUMENTED,
+        effectTags = {OptionEffectTag.EXECUTION},
+        metadataTags = {OptionMetadataTag.EXPERIMENTAL},
+        help = "Report producer-keyed test cache eligibility and computed identities.")
+    public boolean experimentalProducerKeyedTestCacheDebug;
 
     @Option(
         name = "test_timeout",
@@ -414,6 +446,18 @@ public class TestConfiguration extends Fragment {
 
   public boolean getTestRunnerFailFast() {
     return options.testRunnerFailFast;
+  }
+
+  public boolean experimentalProducerKeyedTestCache() {
+    return options.experimentalProducerKeyedTestCache;
+  }
+
+  public ImmutableSet<String> experimentalProducerKeyedTestCacheProducerMnemonics() {
+    return ImmutableSet.copyOf(options.experimentalProducerKeyedTestCacheProducerMnemonics);
+  }
+
+  public boolean experimentalProducerKeyedTestCacheDebug() {
+    return options.experimentalProducerKeyedTestCacheDebug;
   }
 
   public TriState cacheTestResults() {

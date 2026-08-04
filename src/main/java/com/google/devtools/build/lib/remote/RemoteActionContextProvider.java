@@ -23,6 +23,7 @@ import com.google.devtools.build.lib.exec.ModuleActionContextRegistry;
 import com.google.devtools.build.lib.exec.SpawnCache;
 import com.google.devtools.build.lib.exec.SpawnStrategyRegistry;
 import com.google.devtools.build.lib.packages.semantics.BuildLanguageOptions;
+import com.google.devtools.build.lib.remote.common.ProducerActionKeyContext;
 import com.google.devtools.build.lib.remote.common.RemoteExecutionClient;
 import com.google.devtools.build.lib.remote.common.RemotePathResolver;
 import com.google.devtools.build.lib.remote.common.RemotePathResolver.DefaultRemotePathResolver;
@@ -224,6 +225,10 @@ final class RemoteActionContextProvider {
             getRemoteExecutionService(),
             digestUtil);
     registryBuilder.register(SpawnCache.class, spawnCache, "remote-cache");
+    registryBuilder.register(
+        ProducerActionKeyContext.class,
+        new RemoteProducerActionKeyContext(getRemoteExecutionService(), env.getExecRoot()),
+        "producer-action-key");
   }
 
   CombinedCache getCombinedCache() {

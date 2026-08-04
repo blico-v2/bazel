@@ -51,19 +51,33 @@ import com.google.devtools.build.lib.actions.Actions;
 import com.google.devtools.build.lib.actions.AlreadyReportedActionExecutionException;
 import com.google.devtools.build.lib.actions.Artifact;
 import com.google.devtools.build.lib.actions.Artifact.ArchivedTreeArtifact;
+import com.google.devtools.build.lib.actions.Artifact.DerivedArtifact;
 import com.google.devtools.build.lib.actions.Artifact.SpecialArtifact;
 import com.google.devtools.build.lib.actions.Artifact.TreeFileArtifact;
 import com.google.devtools.build.lib.actions.ArtifactExpander;
 import com.google.devtools.build.lib.actions.ArtifactPathResolver;
+import com.google.devtools.build.lib.actions.CommandLineExpansionException;
 import com.google.devtools.build.lib.actions.DiscoveredInputsEvent;
+import com.google.devtools.build.lib.actions.ExecException;
 import com.google.devtools.build.lib.actions.FileArtifactValue;
 import com.google.devtools.build.lib.actions.FilesetOutputTree;
+import com.google.devtools.build.lib.actions.ForbiddenActionInputException;
 import com.google.devtools.build.lib.actions.InputMetadataProvider;
 import com.google.devtools.build.lib.actions.LostInputsActionExecutionException;
+import com.google.devtools.build.lib.actions.MiddlemanAction;
 import com.google.devtools.build.lib.actions.PackageRootResolver;
+import com.google.devtools.build.lib.actions.RunfilesTree;
 import com.google.devtools.build.lib.actions.SpawnMetrics;
 import com.google.devtools.build.lib.actions.cache.OutputMetadataStore;
 import com.google.devtools.build.lib.analysis.BlazeDirectories;
+import com.google.devtools.build.lib.analysis.test.ProducerKeyedTestCacheEligibility;
+import com.google.devtools.build.lib.analysis.test.ProducerKeyedTestCacheEligibility.Eligible;
+import com.google.devtools.build.lib.analysis.test.ProducerKeyedTestCacheEligibility.Ineligible;
+import com.google.devtools.build.lib.analysis.test.ProducerKeyedTestIdentity;
+import com.google.devtools.build.lib.analysis.test.ProducerKeyedTestIdentity.DeclaredOutput;
+import com.google.devtools.build.lib.analysis.test.ProducerKeyedTestIdentity.LogicalInput;
+import com.google.devtools.build.lib.analysis.test.TestConfiguration;
+import com.google.devtools.build.lib.analysis.test.TestRunnerAction;
 import com.google.devtools.build.lib.bugreport.BugReport;
 import com.google.devtools.build.lib.bugreport.BugReporter;
 import com.google.devtools.build.lib.causes.Cause;
@@ -76,6 +90,7 @@ import com.google.devtools.build.lib.collect.nestedset.ArtifactNestedSetKey;
 import com.google.devtools.build.lib.collect.nestedset.NestedSet;
 import com.google.devtools.build.lib.collect.nestedset.NestedSetBuilder;
 import com.google.devtools.build.lib.collect.nestedset.Order;
+import com.google.devtools.build.lib.events.Event;
 import com.google.devtools.build.lib.io.InconsistentFilesystemException;
 import com.google.devtools.build.lib.packages.BuildFileNotFoundException;
 import com.google.devtools.build.lib.packages.semantics.BuildLanguageOptions;
@@ -83,6 +98,7 @@ import com.google.devtools.build.lib.profiler.Profiler;
 import com.google.devtools.build.lib.profiler.ProfilerTask;
 import com.google.devtools.build.lib.profiler.SilentCloseable;
 import com.google.devtools.build.lib.remote.common.LostInputsEvent;
+import com.google.devtools.build.lib.remote.common.ProducerActionKeyContext;
 import com.google.devtools.build.lib.server.FailureDetails;
 import com.google.devtools.build.lib.server.FailureDetails.Execution;
 import com.google.devtools.build.lib.server.FailureDetails.Execution.Code;
@@ -115,13 +131,16 @@ import com.google.devtools.build.skyframe.SkyKey;
 import com.google.devtools.build.skyframe.SkyValue;
 import com.google.devtools.build.skyframe.SkyframeLookupResult;
 import com.google.errorprone.annotations.CanIgnoreReturnValue;
+import java.io.IOException;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -262,6 +281,49 @@ public final class ActionExecutionFunction implements SkyFunction {
       clientEnv = ImmutableMap.of();
     }
 
+    InputDiscoveryState state = null;
+    if (action instanceof TestRunnerAction testAction) {
+      TestConfiguration testConfiguration =
+          testAction.getConfiguration().getFragment(TestConfiguration.class);
+      if (testConfiguration.experimentalProducerKeyedTestCache()) {
+        state = env.getState(InputDiscoveryState::new);
+        if (!state.producerKeyedIdentityComputed) {
+          if (!testAction.shouldAcceptCachedResult()) {
+            reportProducerKeyedTestCacheEligibility(
+                env, testConfiguration, testAction, "CACHE_POLICY_DISALLOWS");
+          } else {
+            Artifact executable = testAction.getExecutionSettings().getExecutable();
+            if (!(executable instanceof DerivedArtifact derivedExecutable)) {
+              reportProducerKeyedTestCacheEligibility(
+                  env, testConfiguration, testAction, "EXECUTABLE_NOT_DERIVED");
+            } else {
+              Action producer =
+                  ActionUtils.getActionForLookupData(
+                      env, derivedExecutable.getGeneratingActionKey());
+              if (producer == null) {
+                return null;
+              }
+              switch (ProducerKeyedTestCacheEligibility.check(
+                  testAction,
+                  producer,
+                  testConfiguration.experimentalProducerKeyedTestCacheProducerMnemonics())) {
+                case Eligible eligible -> {
+                  if (!computeAndReportProducerActionKey(
+                      env, testConfiguration, testAction, eligible.producer(), clientEnv)) {
+                    return null;
+                  }
+                }
+                case Ineligible ineligible ->
+                    reportProducerKeyedTestCacheEligibility(
+                        env, testConfiguration, testAction, ineligible.reason().name());
+              }
+            }
+          }
+          state.producerKeyedIdentityComputed = true;
+        }
+      }
+    }
+
     // If two actions are shared and the first one executes, when the second one goes to execute, we
     // should detect that and short-circuit.
     //
@@ -280,13 +342,14 @@ public final class ActionExecutionFunction implements SkyFunction {
       env = new ProgressEventSuppressingEnvironment(env);
     }
 
-    InputDiscoveryState state;
-    if (action.discoversInputs()) {
-      state = env.getState(InputDiscoveryState::new);
-    } else {
-      // Because this is a new state, all conditionals below about whether state has already done
-      // something will return false, and so we will execute all necessary steps.
-      state = new InputDiscoveryState();
+    if (state == null) {
+      if (action.discoversInputs()) {
+        state = env.getState(InputDiscoveryState::new);
+      } else {
+        // Because this is a new state, all conditionals below about whether state has already done
+        // something will return false, and so we will execute all necessary steps.
+        state = new InputDiscoveryState();
+      }
     }
     if (!state.hasCollectedInputs()) {
       try {
@@ -346,7 +409,7 @@ public final class ActionExecutionFunction implements SkyFunction {
       throw new ActionExecutionFunctionException(
           skyframeActionExecutor.processAndGetExceptionToThrow(
               env.getListener(),
-              /*primaryOutputPath=*/ null,
+              /* primaryOutputPath= */ null,
               action,
               e,
               new FileOutErr(),
@@ -437,6 +500,291 @@ public final class ActionExecutionFunction implements SkyFunction {
     }
 
     return result;
+  }
+
+  private static void reportProducerKeyedTestCacheEligibility(
+      Environment env, TestConfiguration configuration, TestRunnerAction action, String result) {
+    if (configuration.experimentalProducerKeyedTestCacheDebug()) {
+      env.getListener()
+          .handle(
+              Event.info(
+                  String.format(
+                      "producer-keyed test cache: %s: %s", action.getOwner().getLabel(), result)));
+    }
+  }
+
+  private boolean computeAndReportProducerActionKey(
+      Environment env,
+      TestConfiguration configuration,
+      TestRunnerAction testAction,
+      com.google.devtools.build.lib.analysis.actions.SpawnAction producer,
+      ImmutableMap<String, String> clientEnv)
+      throws InterruptedException, ActionExecutionFunctionException, UndoneInputsException {
+    long producerDigestStartNanos = BlazeClock.nanoTime();
+    ProducerActionKeyContext keyContext =
+        skyframeActionExecutor
+            .getActionContextRegistry()
+            .getContext(ProducerActionKeyContext.class);
+    if (keyContext == null) {
+      reportProducerKeyedTestCacheEligibility(env, configuration, testAction, "CACHE_UNCONFIGURED");
+      return true;
+    }
+
+    NestedSet<Artifact> producerInputs = producer.getInputs();
+    InputDiscoveryState producerState = new InputDiscoveryState();
+    ImmutableSet<SkyKey> producerInputKeys =
+        getInputDepKeys(
+            producer,
+            consumedArtifactsTrackerSupplier.get(),
+            producerInputs,
+            producer.getSchedulingDependencies(),
+            producerState);
+    SkyframeLookupResult producerInputValues = env.getValuesAndExceptions(producerInputKeys);
+    CheckInputResults checkedInputs;
+    try {
+      checkedInputs =
+          checkInputs(env, producer, producerInputValues, producerInputs, producerInputKeys);
+    } catch (ActionExecutionException e) {
+      throw new ActionExecutionFunctionException(e);
+    }
+    if (checkedInputs == null || env.valuesMissing()) {
+      return false;
+    }
+    if (!checkedInputs.filesetsInsideRunfiles.isEmpty()
+        || !checkedInputs.topLevelFilesets.isEmpty()) {
+      reportProducerKeyedTestCacheEligibility(
+          env, configuration, testAction, "UNSUPPORTED_PRODUCER_FILESETS");
+      return true;
+    }
+
+    ImmutableMap<Artifact, FilesetOutputTree> expandedFilesets =
+        ImmutableMap.<Artifact, FilesetOutputTree>builder()
+            .putAll(checkedInputs.filesetsInsideRunfiles)
+            .putAll(checkedInputs.topLevelFilesets)
+            .buildKeepingLast();
+    ArtifactExpander artifactExpander =
+        new ActionInputArtifactExpander(checkedInputs.actionInputMap, expandedFilesets);
+    ArtifactPathResolver pathResolver =
+        ArtifactPathResolver.createPathResolver(
+            /* actionFileSystem= */ null, skyframeActionExecutor.getExecRoot());
+    InputMetadataProvider inputMetadataProvider =
+        new ActionInputMetadataProvider(
+            skyframeActionExecutor.getExecRoot().asFragment(),
+            checkedInputs.actionInputMap,
+            expandedFilesets);
+    long producerInputBytes = 0;
+    for (Artifact input : producerInputs.toList()) {
+      FileArtifactValue metadata = checkedInputs.actionInputMap.getInputMetadata(input);
+      if (metadata != null) {
+        producerInputBytes += metadata.getSize();
+      }
+    }
+    try {
+      var spawn = producer.getSpawnForActionKey(clientEnv, artifactExpander);
+      var actionKey =
+          keyContext.computeActionKey(spawn, inputMetadataProvider, artifactExpander, pathResolver);
+      return computeAndReportSyntheticTestKey(
+          env,
+          configuration,
+          testAction,
+          clientEnv,
+          keyContext,
+          actionKey,
+          producer.getMnemonic(),
+          producerInputs.toList().size(),
+          producerInputBytes,
+          Duration.ofNanos(BlazeClock.nanoTime() - producerDigestStartNanos).toMillis());
+    } catch (IOException
+        | ExecException
+        | CommandLineExpansionException
+        | ForbiddenActionInputException e) {
+      reportProducerKeyedTestCacheEligibility(
+          env, configuration, testAction, "PRODUCER_DIGEST_UNAVAILABLE: " + e.getMessage());
+      return true;
+    }
+  }
+
+  private boolean computeAndReportSyntheticTestKey(
+      Environment env,
+      TestConfiguration configuration,
+      TestRunnerAction testAction,
+      ImmutableMap<String, String> clientEnv,
+      ProducerActionKeyContext keyContext,
+      com.google.devtools.build.lib.remote.common.RemoteCacheClient.ActionKey producerActionKey,
+      String producerMnemonic,
+      int producerInputCount,
+      long producerInputBytes,
+      long producerDigestComputeMillis)
+      throws InterruptedException, ActionExecutionFunctionException, UndoneInputsException {
+    long runfilesFingerprintStartNanos = BlazeClock.nanoTime();
+    Artifact runfilesMiddleman = testAction.getRunfilesMiddleman();
+    if (!(runfilesMiddleman instanceof DerivedArtifact derivedRunfilesMiddleman)) {
+      reportProducerKeyedTestCacheEligibility(
+          env, configuration, testAction, "UNSUPPORTED_RUNFILES_SHAPE");
+      return true;
+    }
+    Action runfilesAction =
+        ActionUtils.getActionForLookupData(env, derivedRunfilesMiddleman.getGeneratingActionKey());
+    if (runfilesAction == null) {
+      return false;
+    }
+    if (!(runfilesAction instanceof MiddlemanAction middlemanAction)) {
+      reportProducerKeyedTestCacheEligibility(
+          env, configuration, testAction, "UNSUPPORTED_RUNFILES_SHAPE");
+      return true;
+    }
+
+    Artifact executable = testAction.getExecutionSettings().getExecutable();
+    RunfilesTree runfilesTree = middlemanAction.getRunfilesTree();
+    Map<PathFragment, Artifact> runfilesMapping = runfilesTree.getMapping();
+    ImmutableSet<Artifact> mappedRunfilesArtifacts =
+        runfilesMapping.values().stream()
+            .filter(Objects::nonNull)
+            .collect(ImmutableSet.toImmutableSet());
+    NestedSetBuilder<Artifact> logicalArtifacts = NestedSetBuilder.stableOrder();
+    for (Artifact artifact : runfilesMapping.values()) {
+      if (artifact != null && !artifact.equals(executable)) {
+        if (artifact.isTreeArtifact()) {
+          reportProducerKeyedTestCacheEligibility(
+              env, configuration, testAction, "UNSUPPORTED_RUNFILES_SHAPE: tree artifact");
+          return true;
+        }
+        logicalArtifacts.add(artifact);
+      }
+    }
+    for (Artifact input : testAction.getInputs().toList()) {
+      if (input.equals(executable)
+          || input.equals(runfilesMiddleman)
+          || mappedRunfilesArtifacts.contains(input)) {
+        continue;
+      }
+      if (input.isTreeArtifact()) {
+        reportProducerKeyedTestCacheEligibility(
+            env, configuration, testAction, "UNSUPPORTED_RUNFILES_SHAPE: direct tree artifact");
+        return true;
+      }
+      logicalArtifacts.add(input);
+    }
+    NestedSet<Artifact> artifactsToFingerprint = logicalArtifacts.build();
+    InputDiscoveryState logicalInputState = new InputDiscoveryState();
+    ImmutableSet<SkyKey> logicalInputKeys =
+        getInputDepKeys(
+            testAction,
+            consumedArtifactsTrackerSupplier.get(),
+            artifactsToFingerprint,
+            NestedSetBuilder.emptySet(Order.STABLE_ORDER),
+            logicalInputState);
+    SkyframeLookupResult logicalInputValues = env.getValuesAndExceptions(logicalInputKeys);
+    CheckInputResults logicalInputResults;
+    try {
+      logicalInputResults =
+          checkInputs(
+              env, testAction, logicalInputValues, artifactsToFingerprint, logicalInputKeys);
+    } catch (ActionExecutionException e) {
+      throw new ActionExecutionFunctionException(e);
+    }
+    if (logicalInputResults == null || env.valuesMissing()) {
+      return false;
+    }
+
+    ImmutableList.Builder<LogicalInput> logicalInputs = ImmutableList.builder();
+    for (Map.Entry<PathFragment, Artifact> entry : runfilesMapping.entrySet()) {
+      Artifact artifact = entry.getValue();
+      if (artifact == null) {
+        logicalInputs.add(new LogicalInput(entry.getKey().getPathString(), "empty", ""));
+      } else if (artifact.equals(executable)) {
+        logicalInputs.add(
+            new LogicalInput(
+                entry.getKey().getPathString(),
+                "producer",
+                producerActionKey.getDigest().getHash()));
+      } else {
+        FileArtifactValue metadata = logicalInputResults.actionInputMap.getInputMetadata(artifact);
+        if (metadata == null || metadata.getDigest() == null) {
+          reportProducerKeyedTestCacheEligibility(
+              env, configuration, testAction, "RUNFILES_FINGERPRINT_UNAVAILABLE");
+          return true;
+        }
+        logicalInputs.add(
+            new LogicalInput(
+                entry.getKey().getPathString(),
+                artifact.isSourceArtifact() ? "source" : "derived",
+                HexFormat.of().formatHex(metadata.getDigest()) + ":" + metadata.getSize()));
+      }
+    }
+    for (Artifact input : testAction.getInputs().toList()) {
+      if (input.equals(executable)
+          || input.equals(runfilesMiddleman)
+          || mappedRunfilesArtifacts.contains(input)) {
+        continue;
+      }
+      FileArtifactValue metadata = logicalInputResults.actionInputMap.getInputMetadata(input);
+      if (metadata == null || metadata.getDigest() == null) {
+        reportProducerKeyedTestCacheEligibility(
+            env, configuration, testAction, "DIRECT_INPUT_FINGERPRINT_UNAVAILABLE");
+        return true;
+      }
+      logicalInputs.add(
+          new LogicalInput(
+              input.getExecPathString(),
+              input.isSourceArtifact() ? "direct-source" : "direct-derived",
+              HexFormat.of().formatHex(metadata.getDigest()) + ":" + metadata.getSize()));
+    }
+
+    ImmutableList<DeclaredOutput> declaredOutputs =
+        testAction.getOutputs().stream()
+            .map(
+                output ->
+                    new DeclaredOutput(
+                        output.getExecPathString(), output.isTreeArtifact() ? "tree" : "file"))
+            .collect(ImmutableList.toImmutableList());
+    String testActionKey =
+        testAction.getKey(
+            skyframeActionExecutor.getActionKeyContext(),
+            new ActionInputArtifactExpander(logicalInputResults.actionInputMap, ImmutableMap.of()));
+    String ownerLabel = testAction.getOwner().getLabel().getCanonicalForm();
+    String executionPlatform =
+        testAction.getOwner().getExecutionPlatform() == null
+            ? ""
+            : testAction.getOwner().getExecutionPlatform().label().getCanonicalForm();
+    long syntheticKeyStartNanos = BlazeClock.nanoTime();
+    var logicalIdentity =
+        ProducerKeyedTestIdentity.compute(
+            producerActionKey.getDigest().getHash(),
+            producerActionKey.getDigest().getSizeBytes(),
+            testActionKey,
+            ownerLabel,
+            testAction.getOwner().getConfigurationChecksum(),
+            executionPlatform,
+            clientEnv,
+            declaredOutputs,
+            logicalInputs.build());
+    var syntheticKey = keyContext.computeSyntheticTestActionKey(logicalIdentity, producerActionKey);
+    long syntheticKeyComputeMillis =
+        Duration.ofNanos(BlazeClock.nanoTime() - syntheticKeyStartNanos).toMillis();
+    long runfilesFingerprintMillis =
+        Duration.ofNanos(syntheticKeyStartNanos - runfilesFingerprintStartNanos).toMillis();
+    reportProducerKeyedTestCacheEligibility(
+        env,
+        configuration,
+        testAction,
+        "eligible producer="
+            + producerMnemonic
+            + " producer_digest="
+            + producerActionKey.getDigest().getHash()
+            + " early_key="
+            + syntheticKey.getDigest().getHash()
+            + " producer_digest_compute_ms="
+            + producerDigestComputeMillis
+            + " runfiles_fingerprint_ms="
+            + runfilesFingerprintMillis
+            + " synthetic_key_compute_ms="
+            + syntheticKeyComputeMillis
+            + " producer_input_count="
+            + producerInputCount
+            + " producer_input_bytes="
+            + producerInputBytes);
+    return true;
   }
 
   private static ImmutableSet<SkyKey> getInputDepKeys(
@@ -1509,8 +1857,8 @@ public final class ActionExecutionFunction implements SkyFunction {
 
   /**
    * State to save work across restarts of ActionExecutionFunction due to missing values in the
-   * graph for actions that discover inputs. There are three places where we save work, all for
-   * actions that discover inputs:
+   * graph. This is also used while computing producer-keyed test identities. There are three places
+   * where we save input-discovery work:
    *
    * <ol>
    *   <li>If not all known input metadata (coming from Action#getInputs) is available yet, then the
@@ -1536,6 +1884,7 @@ public final class ActionExecutionFunction implements SkyFunction {
     FileSystem actionFileSystem = null;
     boolean preparedInputDiscovery = false;
     boolean actionInputCollectedEventSent = false;
+    boolean producerKeyedIdentityComputed = false;
 
     boolean checkedForConsumedArtifactRegistration = false;
 
@@ -1755,7 +2104,9 @@ public final class ActionExecutionFunction implements SkyFunction {
               input, value.getDetailedExitCode(), action.getOwner().getLabel(), bugReporter));
     }
 
-    /** @throws ActionExecutionException if there is any accumulated exception from the inputs. */
+    /**
+     * @throws ActionExecutionException if there is any accumulated exception from the inputs.
+     */
     void maybeThrowException() throws ActionExecutionException {
       for (LabelCause missingInput : missingArtifactCauses) {
         skyframeActionExecutor.printError(missingInput.getMessage(), action);
@@ -1856,7 +2207,7 @@ public final class ActionExecutionFunction implements SkyFunction {
             codeAndMessage.getSecond(),
             action,
             NestedSetBuilder.wrap(Order.STABLE_ORDER, sourceArtifactErrorCauses),
-            /*catastrophe=*/ false,
+            /* catastrophe= */ false,
             codeAndMessage.getFirst());
     skyframeActionExecutor.printError(ex.getMessage(), action);
     // Don't actually return: throw exception directly so caller can't get it wrong.

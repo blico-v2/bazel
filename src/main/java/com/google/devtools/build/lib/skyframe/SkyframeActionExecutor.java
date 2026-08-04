@@ -354,6 +354,10 @@ public final class SkyframeActionExecutor {
     return executorEngine;
   }
 
+  ActionKeyContext getActionKeyContext() {
+    return actionKeyContext;
+  }
+
   boolean useArchivedTreeArtifacts(ActionAnalysisMetadata action) {
     return options
         .getOptions(CoreOptions.class)

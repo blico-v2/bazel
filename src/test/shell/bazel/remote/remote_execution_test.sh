@@ -2819,6 +2819,123 @@ EOF
   expect_log "6 processes: 2 disk cache hit, 4 internal"
 }
 
+function test_uncached_executable_producer_runs_before_cached_test() {
+  # Reproduces the producer-keyed test-cache problem without depending on rules_go. The test
+  # executable is produced by a SpawnAction with the same mnemonic and remote-cache policy used by
+  # the intended GoLink optimization.
+  mkdir -p producer_keyed_test
+  cat > producer_keyed_test/rule.bzl <<'EOF'
+def _producer_keyed_test_impl(ctx):
+    executable = ctx.actions.declare_file(ctx.label.name)
+    ctx.actions.run_shell(
+        inputs = [ctx.file.script],
+        outputs = [executable],
+        command = "cp %s %s && chmod +x %s" % (
+            ctx.file.script.path,
+            executable.path,
+            executable.path,
+        ),
+        mnemonic = "GoLink",
+        progress_message = "Linking synthetic test %{label}",
+        execution_requirements = {"no-remote-cache": "1"},
+    )
+    return [DefaultInfo(
+        executable = executable,
+        runfiles = ctx.runfiles(files = [executable]),
+    )]
+
+producer_keyed_test = rule(
+    implementation = _producer_keyed_test_impl,
+    test = True,
+    attrs = {
+        "script": attr.label(allow_single_file = True, mandatory = True),
+    },
+)
+EOF
+  cat > producer_keyed_test/BUILD <<'EOF'
+load(":rule.bzl", "producer_keyed_test")
+
+producer_keyed_test(
+    name = "test",
+    script = "test.sh",
+)
+EOF
+  cat > producer_keyed_test/test.sh <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+
+  bazel test \
+    --execution_log_json_file=producer_keyed_first.json \
+    --remote_cache=grpc://localhost:${worker_port} \
+    --spawn_strategy=local \
+    --test_strategy=standalone \
+    //producer_keyed_test:test >& $TEST_log \
+    || fail "Failed to populate the synthetic test result"
+  grep -q '"mnemonic": "GoLink"' producer_keyed_first.json \
+    || fail "GoLink did not execute while populating the synthetic test result"
+
+  bazel clean
+
+  bazel test \
+    --execution_log_json_file=producer_keyed_second.json \
+    --remote_cache=grpc://localhost:${worker_port} \
+    --spawn_strategy=local \
+    --test_strategy=standalone \
+    //producer_keyed_test:test >& $TEST_log \
+    || fail "Failed to restore the synthetic cached test result"
+
+  # This is the behavior the producer-keyed cache intends to remove: GoLink must complete before
+  # the ordinary test cache can report the hit.
+  grep -q '"mnemonic": "GoLink"' producer_keyed_second.json \
+    || fail "GoLink did not execute before restoring the synthetic cached test result"
+  expect_log "//producer_keyed_test:test.*\(cached\).*PASSED"
+
+  bazel clean
+
+  bazel test \
+    --execution_log_json_file=producer_keyed_enabled.json \
+    --experimental_producer_keyed_test_cache \
+    --experimental_producer_keyed_test_cache_debug \
+    --remote_cache=grpc://localhost:${worker_port} \
+    --remote_executor=grpc://localhost:${worker_port} \
+    --spawn_strategy=remote,local \
+    --test_strategy=standalone \
+    //producer_keyed_test:test >& $TEST_log \
+    || fail "Failed to compute a producer-keyed test cache identity"
+
+  # The experimental path is compute-only: it reports both identities, then normal execution still
+  # runs GoLink and accepts the ordinary cached test result.
+  expect_log "producer-keyed test cache:.*producer_digest=.*early_key="
+  grep -q '"mnemonic": "GoLink"' producer_keyed_enabled.json \
+    || fail "GoLink did not execute after computing the producer-keyed identity"
+  expect_log "//producer_keyed_test:test.*\(cached\).*PASSED"
+
+  reported_producer_digest=$(
+    sed -n 's/.*producer_digest=\([0-9a-f]*\) early_key=.*/\1/p' "$TEST_log" | tail -1
+  )
+  executed_producer_digest=$(
+    python3 - producer_keyed_enabled.json <<'PY'
+import json
+import sys
+
+data = open(sys.argv[1], encoding="utf-8").read()
+decoder = json.JSONDecoder()
+offset = 0
+while offset < len(data):
+    while offset < len(data) and data[offset].isspace():
+        offset += 1
+    if offset == len(data):
+        break
+    entry, offset = decoder.raw_decode(data, offset)
+    if entry.get("mnemonic") == "GoLink":
+        print(entry.get("digest", {}).get("hash", ""))
+        break
+PY
+  )
+  assert_equals "$executed_producer_digest" "$reported_producer_digest"
+}
+
 # Bazel assumes that non-ASCII characters in file contents (and, in
 # non-Windows systems, file paths) are UTF-8, but stores them internally by
 # parsing the raw UTF-8 bytes as if they were ISO-8859-1 characters.
