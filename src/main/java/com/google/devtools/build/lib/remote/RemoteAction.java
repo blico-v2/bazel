@@ -14,6 +14,7 @@
 package com.google.devtools.build.lib.remote;
 
 import build.bazel.remote.execution.v2.Action;
+import build.bazel.remote.execution.v2.ActionResult;
 import build.bazel.remote.execution.v2.Command;
 import build.bazel.remote.execution.v2.Digest;
 import com.google.devtools.build.lib.actions.ActionInput;
@@ -38,6 +39,21 @@ import javax.annotation.Nullable;
  */
 public class RemoteAction {
 
+  enum ShadowLookupStatus {
+    NOT_ATTEMPTED,
+    HIT,
+    MISS,
+    UNAVAILABLE,
+    ERROR
+  }
+
+  record ShadowLookupResult(
+      ShadowLookupStatus status, @Nullable ActionResult actionResult, @Nullable String cacheName) {
+    static ShadowLookupResult notAttempted() {
+      return new ShadowLookupResult(ShadowLookupStatus.NOT_ATTEMPTED, null, null);
+    }
+  }
+
   private final Spawn spawn;
   private final SpawnExecutionContext spawnExecutionContext;
   private final RemoteActionExecutionContext remoteActionExecutionContext;
@@ -51,6 +67,7 @@ public class RemoteAction {
   private final ActionKey actionKey;
   @Nullable private final SyntheticTestActionKey syntheticTestActionKey;
   private final boolean producerKeyedDebugEnabled;
+  private final ShadowLookupResult shadowLookupResult;
 
   RemoteAction(
       Spawn spawn,
@@ -64,6 +81,7 @@ public class RemoteAction {
       ActionKey actionKey,
       @Nullable SyntheticTestActionKey syntheticTestActionKey,
       boolean producerKeyedDebugEnabled,
+      ShadowLookupResult shadowLookupResult,
       boolean remoteDiscardMerkleTrees) {
     this.spawn = spawn;
     this.spawnExecutionContext = spawnExecutionContext;
@@ -78,6 +96,7 @@ public class RemoteAction {
     this.actionKey = actionKey;
     this.syntheticTestActionKey = syntheticTestActionKey;
     this.producerKeyedDebugEnabled = producerKeyedDebugEnabled;
+    this.shadowLookupResult = shadowLookupResult;
   }
 
   public RemoteActionExecutionContext getRemoteActionExecutionContext() {
@@ -122,6 +141,10 @@ public class RemoteAction {
 
   public boolean isProducerKeyedDebugEnabled() {
     return producerKeyedDebugEnabled;
+  }
+
+  ShadowLookupResult getShadowLookupResult() {
+    return shadowLookupResult;
   }
 
   /** Returns underlying {@link Action} of this remote action. */

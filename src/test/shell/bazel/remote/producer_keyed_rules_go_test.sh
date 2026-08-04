@@ -251,6 +251,24 @@ PY
   grep -q '"mnemonic": "GoLink"' write_alias.json \
     || fail "Write-only rules_go mode unexpectedly skipped GoLink"
 
+  bazel clean >& /dev/null
+  bazel test \
+    --experimental_producer_keyed_test_cache \
+    --experimental_producer_keyed_test_cache_shadow \
+    --experimental_producer_keyed_test_cache_debug \
+    --execution_log_json_file=shadow_hit.json \
+    --remote_cache="grpc://localhost:${worker_port}" \
+    --remote_executor="grpc://localhost:${worker_port}" \
+    --spawn_strategy=remote,local \
+    --test_strategy=standalone \
+    //pkg:pkg_test >& "$TEST_log" \
+    || fail "Failed real rules_go shadow-hit invocation"
+  assert_equals "$baseline_key" "$(extract_early_keys)"
+  expect_log "producer-keyed test cache: shadow_lookup=hit early_key=$baseline_key"
+  expect_log "producer-keyed test cache: shadow_compare=match early_key=$baseline_key"
+  grep -q '"mnemonic": "GoLink"' shadow_hit.json \
+    || fail "Shadow rules_go mode unexpectedly skipped GoLink"
+
   local stable_key noop_source_key source_key data_key linkopts_key args_key env_key run_under_key
   stable_key="$(run_clean_key //pkg:pkg_test)"
   assert_equals "$baseline_key" "$stable_key"

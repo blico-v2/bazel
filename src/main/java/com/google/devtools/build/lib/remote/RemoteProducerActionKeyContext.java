@@ -94,7 +94,8 @@ final class RemoteProducerActionKeyContext implements ProducerActionKeyContext {
   public void registerSyntheticTestActionKey(
       ActionExecutionMetadata action,
       SyntheticTestActionKey syntheticActionKey,
-      boolean debugEnabled) {
+      boolean debugEnabled)
+      throws InterruptedException {
     remoteExecutionService.registerSyntheticTestActionKey(action, syntheticActionKey, debugEnabled);
   }
 

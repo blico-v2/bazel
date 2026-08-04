@@ -47,5 +47,6 @@ public interface ProducerActionKeyContext extends ActionContext {
   void registerSyntheticTestActionKey(
       ActionExecutionMetadata action,
       SyntheticTestActionKey syntheticActionKey,
-      boolean debugEnabled);
+      boolean debugEnabled)
+      throws InterruptedException;
 }

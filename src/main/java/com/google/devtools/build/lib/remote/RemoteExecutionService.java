@@ -53,6 +53,7 @@ import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
+import com.google.common.base.Stopwatch;
 import com.google.common.base.Throwables;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
@@ -93,6 +94,8 @@ import com.google.devtools.build.lib.profiler.Profiler;
 import com.google.devtools.build.lib.profiler.ProfilerTask;
 import com.google.devtools.build.lib.profiler.SilentCloseable;
 import com.google.devtools.build.lib.remote.CombinedCache.CachedActionResult;
+import com.google.devtools.build.lib.remote.RemoteAction.ShadowLookupResult;
+import com.google.devtools.build.lib.remote.RemoteAction.ShadowLookupStatus;
 import com.google.devtools.build.lib.remote.RemoteExecutionService.ActionResultMetadata.DirectoryMetadata;
 import com.google.devtools.build.lib.remote.RemoteExecutionService.ActionResultMetadata.FileMetadata;
 import com.google.devtools.build.lib.remote.RemoteExecutionService.ActionResultMetadata.SymlinkMetadata;
@@ -199,7 +202,7 @@ public class RemoteExecutionService {
       syntheticTestActionKeys = Collections.synchronizedMap(new IdentityHashMap<>());
 
   private record RegisteredSyntheticTestActionKey(
-      SyntheticTestActionKey key, boolean debugEnabled) {}
+      SyntheticTestActionKey key, boolean debugEnabled, ShadowLookupResult shadowLookupResult) {}
 
   @SuppressWarnings("AllowVirtualThreads")
   private final ExecutorService backgroundTaskExecutor =
@@ -705,6 +708,9 @@ public class RemoteExecutionService {
           registeredSyntheticTestActionKey == null ? null : registeredSyntheticTestActionKey.key(),
           registeredSyntheticTestActionKey != null
               && registeredSyntheticTestActionKey.debugEnabled(),
+          registeredSyntheticTestActionKey == null
+              ? ShadowLookupResult.notAttempted()
+              : registeredSyntheticTestActionKey.shadowLookupResult(),
           remoteOptions.remoteDiscardMerkleTrees);
     } finally {
       maybeReleaseRemoteActionBuildingSemaphore();
@@ -718,12 +724,129 @@ public class RemoteExecutionService {
   void registerSyntheticTestActionKey(
       ActionExecutionMetadata action,
       SyntheticTestActionKey syntheticActionKey,
-      boolean debugEnabled) {
-    if (!remoteOptions.producerKeyedTestCacheWriteAliases) {
+      boolean debugEnabled)
+      throws InterruptedException {
+    if (!remoteOptions.producerKeyedTestCacheWriteAliases
+        && !remoteOptions.producerKeyedTestCacheShadow) {
       return;
     }
+    ShadowLookupResult shadowLookupResult = ShadowLookupResult.notAttempted();
+    if (remoteOptions.producerKeyedTestCacheShadow) {
+      shadowLookupResult = lookupSyntheticTestActionAlias(action, syntheticActionKey, debugEnabled);
+    }
     syntheticTestActionKeys.put(
-        action, new RegisteredSyntheticTestActionKey(syntheticActionKey, debugEnabled));
+        action,
+        new RegisteredSyntheticTestActionKey(syntheticActionKey, debugEnabled, shadowLookupResult));
+  }
+
+  private ShadowLookupResult lookupSyntheticTestActionAlias(
+      ActionExecutionMetadata action,
+      SyntheticTestActionKey syntheticActionKey,
+      boolean debugEnabled)
+      throws InterruptedException {
+    Stopwatch stopwatch = Stopwatch.createStarted();
+    ShadowLookupResult result;
+    try {
+      checkNotNull(combinedCache);
+      boolean allowRemoteCache =
+          useRemoteCache()
+              && remoteOptions.remoteAcceptCached
+              && Spawns.mayBeCachedRemotely(action.getExecutionInfo());
+      boolean allowDiskCache = useDiskCache() && Spawns.mayBeCached(action.getExecutionInfo());
+      CachePolicy readPolicy = CachePolicy.create(allowRemoteCache, allowDiskCache);
+      if (!readPolicy.allowAnyCache()) {
+        result = new ShadowLookupResult(ShadowLookupStatus.MISS, null, null);
+      } else {
+        RequestMetadata metadata =
+            TracingMetadataUtils.buildMetadata(
+                buildRequestId,
+                commandId,
+                syntheticActionKey.actionKey().getDigest().getHash(),
+                action);
+        RemoteActionExecutionContext context =
+            RemoteActionExecutionContext.create(metadata)
+                .withReadCachePolicy(readPolicy)
+                .withWriteCachePolicy(CachePolicy.NO_CACHE);
+        CachedActionResult cachedActionResult =
+            combinedCache.downloadActionResult(
+                context,
+                syntheticActionKey.actionKey(),
+                /* inlineOutErr= */ false,
+                ImmutableSet.of());
+        if (cachedActionResult == null) {
+          result = new ShadowLookupResult(ShadowLookupStatus.MISS, null, null);
+        } else if (hasMissingShadowOutputs(context, cachedActionResult)) {
+          result =
+              new ShadowLookupResult(
+                  ShadowLookupStatus.UNAVAILABLE, null, cachedActionResult.cacheName());
+        } else {
+          result =
+              new ShadowLookupResult(
+                  ShadowLookupStatus.HIT,
+                  cachedActionResult.actionResult(),
+                  cachedActionResult.cacheName());
+        }
+      }
+    } catch (InterruptedException e) {
+      throw e;
+    } catch (Exception e) {
+      result = new ShadowLookupResult(ShadowLookupStatus.ERROR, null, null);
+      if (debugEnabled) {
+        report(
+            Event.warn(
+                "producer-keyed test cache: shadow_lookup=error early_key="
+                    + syntheticActionKey.actionKey().getDigest().getHash()
+                    + ": "
+                    + grpcAwareErrorMessage(e, verboseFailures)));
+      }
+    }
+    if (debugEnabled && result.status() != ShadowLookupStatus.ERROR) {
+      report(
+          Event.info(
+              "producer-keyed test cache: shadow_lookup="
+                  + result.status().name().toLowerCase()
+                  + " early_key="
+                  + syntheticActionKey.actionKey().getDigest().getHash()
+                  + " cache="
+                  + Objects.toString(result.cacheName(), "none")
+                  + " shadow_lookup_ms="
+                  + stopwatch.elapsed().toMillis()));
+    }
+    return result;
+  }
+
+  private boolean hasMissingShadowOutputs(
+      RemoteActionExecutionContext context, CachedActionResult cachedActionResult)
+      throws IOException, InterruptedException {
+    ImmutableSet.Builder<Digest> referencedDigests = ImmutableSet.builder();
+    ActionResult actionResult = cachedActionResult.actionResult();
+    actionResult.getOutputFilesList().stream()
+        .filter(outputFile -> outputFile.getContents().isEmpty())
+        .map(OutputFile::getDigest)
+        .filter(digest -> digest.getSizeBytes() > 0)
+        .forEach(referencedDigests::add);
+    actionResult.getOutputDirectoriesList().stream()
+        .map(OutputDirectory::getTreeDigest)
+        .filter(digest -> digest.getSizeBytes() > 0)
+        .forEach(referencedDigests::add);
+    if (actionResult.getStdoutRaw().isEmpty()
+        && actionResult.hasStdoutDigest()
+        && actionResult.getStdoutDigest().getSizeBytes() > 0) {
+      referencedDigests.add(actionResult.getStdoutDigest());
+    }
+    if (actionResult.getStderrRaw().isEmpty()
+        && actionResult.hasStderrDigest()
+        && actionResult.getStderrDigest().getSizeBytes() > 0) {
+      referencedDigests.add(actionResult.getStderrDigest());
+    }
+    CachePolicy sourcePolicy =
+        cachedActionResult.cacheName().equals("disk")
+            ? CachePolicy.DISK_CACHE_ONLY
+            : CachePolicy.REMOTE_CACHE_ONLY;
+    return !getFromFuture(
+            combinedCache.findMissingDigests(
+                context.withWriteCachePolicy(sourcePolicy), referencedDigests.build()))
+        .isEmpty();
   }
 
   @Nullable
@@ -1565,7 +1688,15 @@ public class RemoteExecutionService {
                 result.actionResult));
       }
 
+      compareSyntheticTestActionShadowResult(
+          action,
+          result.actionResult,
+          result.cacheHit(),
+          result.cacheHit() ? Objects.toString(result.cacheName(), "cache") : "remote");
       uploadSyntheticTestActionAlias(action, result.actionResult);
+    } else {
+      compareSyntheticTestActionShadowResult(
+          action, result.actionResult, result.cacheHit(), "failed-remote");
     }
 
     if (inMemoryOutput != null && inMemoryOutputData.get() != null) {
@@ -1926,6 +2057,8 @@ public class RemoteExecutionService {
       UploadManifest manifest = buildUploadManifest(action, spawnResult);
       ActionResult actionResult =
           manifest.upload(action.getRemoteActionExecutionContext(), combinedCache, reporter);
+      compareSyntheticTestActionShadowResult(
+          action, actionResult, /* normalCacheHit= */ false, "local");
       uploadSyntheticTestActionAlias(action, actionResult);
     } catch (IOException e) {
       reportUploadError(e);
@@ -1980,6 +2113,91 @@ public class RemoteExecutionService {
                     + grpcAwareErrorMessage(e, verboseFailures)));
       }
     }
+  }
+
+  @VisibleForTesting
+  void compareSyntheticTestActionShadowResult(
+      RemoteAction action,
+      ActionResult normalActionResult,
+      boolean normalCacheHit,
+      String normalSource) {
+    ShadowLookupResult shadowLookupResult = action.getShadowLookupResult();
+    String comparison = null;
+    boolean disagreement = false;
+    switch (shadowLookupResult.status()) {
+      case HIT -> {
+        ActionResult shadowActionResult = checkNotNull(shadowLookupResult.actionResult());
+        if (shadowActionResult.getExitCode() == 0 && normalActionResult.getExitCode() != 0) {
+          comparison = "early_pass_normal_fail";
+          disagreement = true;
+        } else if (canonicalizeShadowActionResult(shadowActionResult)
+            .equals(canonicalizeShadowActionResult(normalActionResult))) {
+          comparison = "match";
+        } else {
+          comparison = "result_mismatch";
+          disagreement = true;
+        }
+      }
+      case MISS -> {
+        if (normalCacheHit) {
+          comparison = "early_miss_normal_cache_hit";
+          disagreement = true;
+        }
+      }
+      case UNAVAILABLE -> {
+        comparison = "early_outputs_unavailable";
+        disagreement = true;
+      }
+      case NOT_ATTEMPTED, ERROR -> {
+        return;
+      }
+    }
+    if (comparison != null && action.isProducerKeyedDebugEnabled()) {
+      String message =
+          "producer-keyed test cache: shadow_compare="
+              + comparison
+              + " early_key="
+              + checkNotNull(action.getSyntheticTestActionKey()).actionKey().getDigest().getHash()
+              + " early_cache="
+              + Objects.toString(shadowLookupResult.cacheName(), "none")
+              + " normal_source="
+              + normalSource;
+      report(disagreement ? Event.warn(message) : Event.info(message));
+    }
+  }
+
+  void reportSyntheticTestActionShadowFailure(RemoteAction action, String normalSource) {
+    compareSyntheticTestActionShadowResult(
+        action,
+        ActionResult.newBuilder().setExitCode(1).build(),
+        /* normalCacheHit= */ false,
+        normalSource);
+  }
+
+  private ActionResult canonicalizeShadowActionResult(ActionResult actionResult) {
+    ActionResult.Builder builder = actionResult.toBuilder().clearExecutionMetadata();
+    ImmutableList<OutputFile> outputFiles =
+        actionResult.getOutputFilesList().stream()
+            .map(outputFile -> outputFile.toBuilder().clearContents().build())
+            .collect(ImmutableList.toImmutableList());
+    builder.clearOutputFiles().addAllOutputFiles(outputFiles);
+    if (!actionResult.getStdoutRaw().isEmpty()) {
+      builder
+          .clearStdoutRaw()
+          .setStdoutDigest(digestUtil.compute(actionResult.getStdoutRaw().toByteArray()));
+    } else if (actionResult.hasStdoutDigest()
+        && actionResult.getStdoutDigest().getSizeBytes() == 0) {
+      builder.clearStdoutDigest();
+    }
+    if (!actionResult.getStderrRaw().isEmpty()) {
+      builder
+          .clearStderrRaw()
+          .setStderrDigest(digestUtil.compute(actionResult.getStderrRaw().toByteArray()));
+    } else if (actionResult.hasStderrDigest()
+        && actionResult.getStderrDigest().getSizeBytes() == 0) {
+      builder.clearStderrDigest();
+    }
+    return builder.build();
   }
 
   private void checkForConcurrentModifications(

@@ -2960,6 +2960,47 @@ PY
     || fail "Producer-keyed alias was not present in the remote action cache"
   grep -q '"mnemonic": "GoLink"' producer_keyed_write_alias.json \
     || fail "Write-only mode unexpectedly skipped GoLink"
+
+  bazel clean
+
+  bazel test \
+    --execution_log_json_file=producer_keyed_shadow_hit.json \
+    --experimental_producer_keyed_test_cache \
+    --experimental_producer_keyed_test_cache_shadow \
+    --experimental_producer_keyed_test_cache_debug \
+    --remote_cache=grpc://localhost:${worker_port} \
+    --remote_executor=grpc://localhost:${worker_port} \
+    --spawn_strategy=remote,local \
+    --test_strategy=standalone \
+    //producer_keyed_test:test >& $TEST_log \
+    || fail "Failed producer-keyed shadow-hit invocation"
+
+  expect_log "producer-keyed test cache: shadow_lookup=hit early_key=$reported_early_key"
+  expect_log "producer-keyed test cache: shadow_compare=match early_key=$reported_early_key"
+  grep -q '"mnemonic": "GoLink"' producer_keyed_shadow_hit.json \
+    || fail "Shadow-hit mode unexpectedly skipped GoLink"
+
+  rm -f "$cas_path/ac/${reported_early_key:0:2}/$reported_early_key"
+  bazel clean
+
+  bazel test \
+    --execution_log_json_file=producer_keyed_shadow_miss.json \
+    --experimental_producer_keyed_test_cache \
+    --experimental_producer_keyed_test_cache_shadow \
+    --experimental_producer_keyed_test_cache_debug \
+    --remote_cache=grpc://localhost:${worker_port} \
+    --remote_executor=grpc://localhost:${worker_port} \
+    --spawn_strategy=remote,local \
+    --test_strategy=standalone \
+    //producer_keyed_test:test >& $TEST_log \
+    || fail "Failed producer-keyed shadow-miss invocation"
+
+  expect_log "producer-keyed test cache: shadow_lookup=miss early_key=$reported_early_key"
+  expect_log "producer-keyed test cache: shadow_compare=early_miss_normal_cache_hit"
+  [[ -f "$cas_path/ac/${reported_early_key:0:2}/$reported_early_key" ]] \
+    || fail "Shadow mode did not backfill the missing producer-keyed alias"
+  grep -q '"mnemonic": "GoLink"' producer_keyed_shadow_miss.json \
+    || fail "Shadow-miss mode unexpectedly skipped GoLink"
 }
 
 # Bazel assumes that non-ASCII characters in file contents (and, in

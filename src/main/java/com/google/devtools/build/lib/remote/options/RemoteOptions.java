@@ -61,6 +61,18 @@ public final class RemoteOptions extends CommonRemoteOptions {
   public boolean producerKeyedTestCacheWriteAliases;
 
   @Option(
+      name = "experimental_producer_keyed_test_cache_shadow",
+      defaultValue = "false",
+      documentationCategory = OptionDocumentationCategory.UNDOCUMENTED,
+      effectTags = {OptionEffectTag.EXECUTION},
+      metadataTags = {OptionMetadataTag.EXPERIMENTAL},
+      help =
+          "Read producer-keyed aliases before normal test input collection, but always continue "
+              + "normal execution and compare the results. Shadow mode also backfills aliases and "
+              + "requires --experimental_producer_keyed_test_cache.")
+  public boolean producerKeyedTestCacheShadow;
+
+  @Option(
       name = "remote_proxy",
       oldName = "remote_cache_proxy",
       defaultValue = "null",
