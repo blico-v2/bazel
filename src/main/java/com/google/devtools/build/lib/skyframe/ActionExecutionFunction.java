@@ -309,7 +309,7 @@ public final class ActionExecutionFunction implements SkyFunction {
                   testConfiguration.experimentalProducerKeyedTestCacheProducerMnemonics())) {
                 case Eligible eligible -> {
                   if (!computeAndReportProducerActionKey(
-                      env, testConfiguration, testAction, eligible.producer(), clientEnv)) {
+                      env, testConfiguration, testAction, eligible.producer(), clientEnv, state)) {
                     return null;
                   }
                 }
@@ -320,6 +320,15 @@ public final class ActionExecutionFunction implements SkyFunction {
             }
           }
           state.producerKeyedIdentityComputed = true;
+        }
+        if (state.producerKeyedEarlyHit) {
+          ActionExecutionValue earlyResult =
+              skyframeActionExecutor.completeEarlyActionCacheHit(
+                  env.getListener(), testAction, BlazeClock.nanoTime(), tsgm.get());
+          if (earlyResult != null) {
+            return earlyResult;
+          }
+          state.producerKeyedEarlyHit = false;
         }
       }
     }
@@ -518,7 +527,8 @@ public final class ActionExecutionFunction implements SkyFunction {
       TestConfiguration configuration,
       TestRunnerAction testAction,
       com.google.devtools.build.lib.analysis.actions.SpawnAction producer,
-      ImmutableMap<String, String> clientEnv)
+      ImmutableMap<String, String> clientEnv,
+      InputDiscoveryState state)
       throws InterruptedException, ActionExecutionFunctionException, UndoneInputsException {
     long producerDigestStartNanos = BlazeClock.nanoTime();
     ProducerActionKeyContext keyContext =
@@ -593,7 +603,8 @@ public final class ActionExecutionFunction implements SkyFunction {
           producer.getMnemonic(),
           producerInputs.toList().size(),
           producerInputBytes,
-          Duration.ofNanos(BlazeClock.nanoTime() - producerDigestStartNanos).toMillis());
+          Duration.ofNanos(BlazeClock.nanoTime() - producerDigestStartNanos).toMillis(),
+          state);
     } catch (IOException
         | ExecException
         | CommandLineExpansionException
@@ -614,7 +625,8 @@ public final class ActionExecutionFunction implements SkyFunction {
       String producerMnemonic,
       int producerInputCount,
       long producerInputBytes,
-      long producerDigestComputeMillis)
+      long producerDigestComputeMillis,
+      InputDiscoveryState state)
       throws InterruptedException, ActionExecutionFunctionException, UndoneInputsException {
     long runfilesFingerprintStartNanos = BlazeClock.nanoTime();
     Artifact runfilesMiddleman = testAction.getRunfilesMiddleman();
@@ -762,6 +774,7 @@ public final class ActionExecutionFunction implements SkyFunction {
     var syntheticKey = keyContext.computeSyntheticTestActionKey(logicalIdentity, producerActionKey);
     keyContext.registerSyntheticTestActionKey(
         testAction, syntheticKey, configuration.experimentalProducerKeyedTestCacheDebug());
+    state.producerKeyedEarlyHit = keyContext.restoreSyntheticTestActionAlias(testAction);
     long syntheticKeyComputeMillis =
         Duration.ofNanos(BlazeClock.nanoTime() - syntheticKeyStartNanos).toMillis();
     long runfilesFingerprintMillis =
@@ -1344,6 +1357,15 @@ public final class ActionExecutionFunction implements SkyFunction {
           new ActionInputArtifactExpander(state.inputArtifactData, expandedFilesets),
           state.token,
           clientEnv);
+      if (action instanceof TestRunnerAction) {
+        ProducerActionKeyContext keyContext =
+            skyframeActionExecutor
+                .getActionContextRegistry()
+                .getContext(ProducerActionKeyContext.class);
+        if (keyContext != null) {
+          keyContext.finalizeSyntheticTestActionAlias(action);
+        }
+      }
     }
   }
 
@@ -1887,6 +1909,7 @@ public final class ActionExecutionFunction implements SkyFunction {
     boolean preparedInputDiscovery = false;
     boolean actionInputCollectedEventSent = false;
     boolean producerKeyedIdentityComputed = false;
+    boolean producerKeyedEarlyHit = false;
 
     boolean checkedForConsumedArtifactRegistration = false;
 

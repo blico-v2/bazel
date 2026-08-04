@@ -269,6 +269,34 @@ PY
   grep -q '"mnemonic": "GoLink"' shadow_hit.json \
     || fail "Shadow rules_go mode unexpectedly skipped GoLink"
 
+  bazel clean >& /dev/null
+  bazel test \
+    --experimental_producer_keyed_test_cache \
+    --experimental_producer_keyed_test_cache_enabled \
+    --experimental_producer_keyed_test_cache_debug \
+    --execution_log_json_file=short_circuit.json \
+    --build_event_json_file=short_circuit.bep.json \
+    --remote_cache="grpc://localhost:${worker_port}" \
+    --remote_executor="grpc://localhost:${worker_port}" \
+    --spawn_strategy=remote,local \
+    --test_strategy=standalone \
+    //pkg:pkg_test >& "$TEST_log" \
+    || fail "Failed real rules_go early short-circuit invocation"
+  expect_log "producer-keyed test cache: early_short_circuit=hit early_key=$baseline_key"
+  expect_log "//pkg:pkg_test.*\(cached\).*PASSED"
+  if grep -q '"mnemonic": "GoLink"' short_circuit.json; then
+    fail "Early rules_go hit unexpectedly requested GoLink"
+  fi
+  if grep -q '"mnemonic": "TestRunner"' short_circuit.json; then
+    fail "Early rules_go hit unexpectedly executed TestRunner"
+  fi
+  [[ -s bazel-testlogs/pkg/pkg_test/test.log ]] \
+    || fail "Early rules_go hit did not restore test.log"
+  grep -q '"testResult"' short_circuit.bep.json \
+    || fail "Early rules_go hit did not publish a BEP test result"
+  grep -q '"id":{"targetCompleted".*"completed"' short_circuit.bep.json \
+    || fail "Early rules_go hit did not publish target completion"
+
   local stable_key noop_source_key source_key data_key linkopts_key args_key env_key run_under_key
   stable_key="$(run_clean_key //pkg:pkg_test)"
   assert_equals "$baseline_key" "$stable_key"

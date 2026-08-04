@@ -185,15 +185,23 @@ public final class CompletionFunction<
     }
     ValueT value = valueAndArtifactsToBuild.first;
     ArtifactsToBuild artifactsToBuild = valueAndArtifactsToBuild.second;
+    boolean producerKeyedEarlyTargetCompletion =
+        key instanceof TargetCompletionValue.TargetCompletionKey targetKey
+            && targetKey.willTest()
+            && skyframeActionExecutor.wasProducerKeyedEarlyCompletedTarget(
+                targetKey.actionLookupKey());
 
     // Ensure that coverage artifacts are built before a target is considered completed.
     ImmutableList<Artifact> allArtifacts = artifactsToBuild.getAllArtifacts().toList();
     InstrumentedFilesInfo instrumentedFilesInfo =
         value.getConfiguredObject().get(InstrumentedFilesInfo.STARLARK_CONSTRUCTOR);
-    Iterable<Artifact> artifactsToRequest = allArtifacts;
+    Iterable<Artifact> artifactsToRequest =
+        producerKeyedEarlyTargetCompletion ? ImmutableList.of() : allArtifacts;
     Artifact baselineCoverage = null;
     FileArtifactValue baselineCoverageValue = null;
-    if (value.getConfiguredObject() instanceof ConfiguredTarget && instrumentedFilesInfo != null) {
+    if (!producerKeyedEarlyTargetCompletion
+        && value.getConfiguredObject() instanceof ConfiguredTarget
+        && instrumentedFilesInfo != null) {
       baselineCoverage = instrumentedFilesInfo.getBaselineCoverageArtifact();
       if (baselineCoverage != null) {
         artifactsToRequest =
@@ -212,7 +220,10 @@ public final class CompletionFunction<
     // heap high-watermark by multiple GB.
     ActionInputMap importantInputMap;
     ImmutableCollection<Artifact> importantArtifacts;
-    if (allArtifactsAreImportant) {
+    if (producerKeyedEarlyTargetCompletion) {
+      importantArtifacts = ImmutableList.of();
+      importantInputMap = inputMap;
+    } else if (allArtifactsAreImportant) {
       importantArtifacts = allArtifacts;
       importantInputMap = inputMap;
     } else {
@@ -486,7 +497,11 @@ public final class CompletionFunction<
             ActionUtils.getActionForLookupData(env, derivedArtifact.getGeneratingActionKey());
         var future =
             actionInputPrefetcher.prefetchFiles(
-                action, ImmutableList.of(artifact), inputMap::getInputMetadata, Priority.LOW, Reason.OUTPUTS);
+                action,
+                ImmutableList.of(artifact),
+                inputMap::getInputMetadata,
+                Priority.LOW,
+                Reason.OUTPUTS);
         futures.add(future);
       }
     }

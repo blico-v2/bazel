@@ -99,6 +99,18 @@ final class RemoteProducerActionKeyContext implements ProducerActionKeyContext {
     remoteExecutionService.registerSyntheticTestActionKey(action, syntheticActionKey, debugEnabled);
   }
 
+  @Override
+  public boolean restoreSyntheticTestActionAlias(ActionExecutionMetadata action)
+      throws InterruptedException {
+    return remoteExecutionService.restoreSyntheticTestActionAlias(action);
+  }
+
+  @Override
+  public void finalizeSyntheticTestActionAlias(ActionExecutionMetadata action)
+      throws InterruptedException {
+    remoteExecutionService.finalizeSyntheticTestActionAlias(action);
+  }
+
   private final class DigestOnlySpawnExecutionContext implements SpawnExecutionContext {
     private final Spawn spawn;
     private final InputMetadataProvider inputMetadataProvider;

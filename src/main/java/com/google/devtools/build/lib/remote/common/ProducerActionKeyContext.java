@@ -49,4 +49,11 @@ public interface ProducerActionKeyContext extends ActionContext {
       SyntheticTestActionKey syntheticActionKey,
       boolean debugEnabled)
       throws InterruptedException;
+
+  /** Returns whether a registered alias was fully restored to the action's output paths. */
+  boolean restoreSyntheticTestActionAlias(ActionExecutionMetadata action)
+      throws InterruptedException;
+
+  /** Adds action-level test status to an alias after normal test completion. */
+  void finalizeSyntheticTestActionAlias(ActionExecutionMetadata action) throws InterruptedException;
 }

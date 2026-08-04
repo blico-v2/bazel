@@ -21,6 +21,7 @@ import static com.google.common.collect.Comparators.min;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.ImmutableSortedMap;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
@@ -74,6 +75,7 @@ import com.google.devtools.build.lib.actions.ScanningActionEvent;
 import com.google.devtools.build.lib.actions.SpawnActionExecutionException;
 import com.google.devtools.build.lib.actions.SpawnResult;
 import com.google.devtools.build.lib.actions.SpawnResult.MetadataLog;
+import com.google.devtools.build.lib.actions.StaticInputMetadataProvider;
 import com.google.devtools.build.lib.actions.StoppedScanningActionEvent;
 import com.google.devtools.build.lib.actions.ThreadStateReceiver;
 import com.google.devtools.build.lib.actions.UserExecException;
@@ -108,6 +110,7 @@ import com.google.devtools.build.lib.util.CrashFailureDetails;
 import com.google.devtools.build.lib.util.DetailedExitCode;
 import com.google.devtools.build.lib.util.ResourceUsage;
 import com.google.devtools.build.lib.util.io.FileOutErr;
+import com.google.devtools.build.lib.util.io.TimestampGranularityMonitor;
 import com.google.devtools.build.lib.vfs.FileSystem;
 import com.google.devtools.build.lib.vfs.FileSystem.NotASymlinkException;
 import com.google.devtools.build.lib.vfs.OutputPermissions;
@@ -198,6 +201,8 @@ public final class SkyframeActionExecutor {
   // get emitted before execution (e.g. ActionStartedEvent, SpawnExecutedEvent) must support
   // receiving more than one of those events per action.
   private Set<OwnerlessArtifactWrapper> rewoundActions;
+  private Set<OwnerlessArtifactWrapper> producerKeyedEarlyCacheHits;
+  private Set<Object> producerKeyedEarlyCompletedTargets;
 
   private ActionOutputDirectoryHelper outputDirectoryHelper;
 
@@ -292,6 +297,8 @@ public final class SkyframeActionExecutor {
     // Start with a new map each build so there's no issue with internal resizing.
     this.buildActionMap = Maps.newConcurrentMap();
     this.rewoundActions = Sets.newConcurrentHashSet();
+    this.producerKeyedEarlyCacheHits = Sets.newConcurrentHashSet();
+    this.producerKeyedEarlyCompletedTargets = Sets.newConcurrentHashSet();
     this.hadExecutionError = false;
     this.actionCacheChecker = checkNotNull(actionCacheChecker);
     // Don't cache possibly stale data from the last build.
@@ -369,6 +376,24 @@ public final class SkyframeActionExecutor {
     return options.getOptions(BuildEventProtocolOptions.class).publishTargetSummary;
   }
 
+  boolean producerKeyedTestCacheEnabled() {
+    RemoteOptions remoteOptions = options.getOptions(RemoteOptions.class);
+    return remoteOptions != null && remoteOptions.producerKeyedTestCacheEnabled;
+  }
+
+  boolean wasProducerKeyedEarlyCacheHit(Action action) {
+    return producerKeyedEarlyCacheHits.contains(
+        new OwnerlessArtifactWrapper(action.getPrimaryOutput()));
+  }
+
+  void recordProducerKeyedEarlyCompletedTarget(Object key) {
+    producerKeyedEarlyCompletedTargets.add(key);
+  }
+
+  boolean wasProducerKeyedEarlyCompletedTarget(Object key) {
+    return producerKeyedEarlyCompletedTargets.contains(key);
+  }
+
   public boolean rewindingEnabled() {
     return rewindingEnabled;
   }
@@ -422,6 +447,8 @@ public final class SkyframeActionExecutor {
     this.outputService = null;
     this.buildActionMap = null;
     this.rewoundActions = null;
+    this.producerKeyedEarlyCacheHits = null;
+    this.producerKeyedEarlyCompletedTargets = null;
     this.actionCacheChecker = null;
     this.outputDirectoryHelper = null;
   }
@@ -770,6 +797,69 @@ public final class SkyframeActionExecutor {
       }
     }
     return token;
+  }
+
+  /** Completes an action whose outputs were restored before its ordinary inputs were collected. */
+  @Nullable
+  ActionExecutionValue completeEarlyActionCacheHit(
+      ExtendedEventHandler eventHandler,
+      Action action,
+      long actionStartTime,
+      TimestampGranularityMonitor tsgm)
+      throws InterruptedException {
+    ArtifactPathResolver pathResolver =
+        ArtifactPathResolver.createPathResolver(
+            /* actionFileSystem= */ null, executorEngine.getExecRoot());
+    ActionOutputMetadataStore outputMetadataStore =
+        ActionOutputMetadataStore.create(
+            useArchivedTreeArtifacts(action),
+            getOutputPermissions(),
+            ImmutableSet.copyOf(action.getOutputs()),
+            getXattrProvider(),
+            tsgm,
+            pathResolver,
+            executorEngine.getExecRoot().asFragment());
+
+    if (action instanceof NotifyOnActionCacheHit notify) {
+      ActionCachedContext context =
+          new ActionCachedContext() {
+            @Override
+            public ExtendedEventHandler getEventHandler() {
+              return selectEventHandler(action);
+            }
+
+            @Override
+            public Path getExecRoot() {
+              return executorEngine.getExecRoot();
+            }
+
+            @Override
+            public ArtifactPathResolver getPathResolver() {
+              return pathResolver;
+            }
+
+            @Override
+            public <T extends ActionContext> T getContext(Class<? extends T> type) {
+              return executorEngine.getContext(type);
+            }
+          };
+      if (!notify.actionCacheHit(context)) {
+        return null;
+      }
+    }
+    if (!checkOutputs(
+        action,
+        outputMetadataStore,
+        /* filesetOutputForMetrics= */ null,
+        /* isActionCacheHitForMetrics= */ true)) {
+      return null;
+    }
+    eventHandler.post(
+        new CachedActionEvent(
+            action, StaticInputMetadataProvider.empty(), actionStartTime, BlazeClock.nanoTime()));
+    producerKeyedEarlyCacheHits.add(new OwnerlessArtifactWrapper(action.getPrimaryOutput()));
+    return ActionExecutionValue.createFromOutputMetadataStore(
+        outputMetadataStore, /* filesetOutput= */ FilesetOutputTree.EMPTY, action);
   }
 
   void updateActionCache(
