@@ -760,6 +760,8 @@ public final class ActionExecutionFunction implements SkyFunction {
             declaredOutputs,
             logicalInputs.build());
     var syntheticKey = keyContext.computeSyntheticTestActionKey(logicalIdentity, producerActionKey);
+    keyContext.registerSyntheticTestActionKey(
+        testAction, syntheticKey, configuration.experimentalProducerKeyedTestCacheDebug());
     long syntheticKeyComputeMillis =
         Duration.ofNanos(BlazeClock.nanoTime() - syntheticKeyStartNanos).toMillis();
     long runfilesFingerprintMillis =
@@ -773,7 +775,7 @@ public final class ActionExecutionFunction implements SkyFunction {
             + " producer_digest="
             + producerActionKey.getDigest().getHash()
             + " early_key="
-            + syntheticKey.getDigest().getHash()
+            + syntheticKey.actionKey().getDigest().getHash()
             + " producer_digest_compute_ms="
             + producerDigestComputeMillis
             + " runfiles_fingerprint_ms="

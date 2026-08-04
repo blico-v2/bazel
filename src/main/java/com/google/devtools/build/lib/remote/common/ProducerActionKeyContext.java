@@ -14,7 +14,11 @@
 
 package com.google.devtools.build.lib.remote.common;
 
+import build.bazel.remote.execution.v2.Action;
+import build.bazel.remote.execution.v2.Command;
+import build.bazel.remote.execution.v2.Directory;
 import com.google.devtools.build.lib.actions.ActionContext;
+import com.google.devtools.build.lib.actions.ActionExecutionMetadata;
 import com.google.devtools.build.lib.actions.ArtifactExpander;
 import com.google.devtools.build.lib.actions.ArtifactPathResolver;
 import com.google.devtools.build.lib.actions.ExecException;
@@ -27,6 +31,9 @@ import java.io.IOException;
 
 /** Action context for computing an exact remote action key without executing or uploading. */
 public interface ProducerActionKeyContext extends ActionContext {
+  record SyntheticTestActionKey(
+      ActionKey actionKey, Action action, Command command, Directory inputRoot) {}
+
   ActionKey computeActionKey(
       Spawn spawn,
       InputMetadataProvider inputMetadataProvider,
@@ -34,5 +41,11 @@ public interface ProducerActionKeyContext extends ActionContext {
       ArtifactPathResolver artifactPathResolver)
       throws IOException, ExecException, ForbiddenActionInputException, InterruptedException;
 
-  ActionKey computeSyntheticTestActionKey(ByteString logicalIdentity, ActionKey producerActionKey);
+  SyntheticTestActionKey computeSyntheticTestActionKey(
+      ByteString logicalIdentity, ActionKey producerActionKey);
+
+  void registerSyntheticTestActionKey(
+      ActionExecutionMetadata action,
+      SyntheticTestActionKey syntheticActionKey,
+      boolean debugEnabled);
 }

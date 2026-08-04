@@ -63,6 +63,7 @@ import com.google.common.eventbus.Subscribe;
 import com.google.common.util.concurrent.Futures;
 import com.google.common.util.concurrent.ListenableFuture;
 import com.google.common.util.concurrent.SettableFuture;
+import com.google.devtools.build.lib.actions.ActionExecutionMetadata;
 import com.google.devtools.build.lib.actions.ActionInput;
 import com.google.devtools.build.lib.actions.Artifact;
 import com.google.devtools.build.lib.actions.ArtifactPathResolver;
@@ -100,6 +101,7 @@ import com.google.devtools.build.lib.remote.common.BulkTransferException;
 import com.google.devtools.build.lib.remote.common.LostInputsEvent;
 import com.google.devtools.build.lib.remote.common.OperationObserver;
 import com.google.devtools.build.lib.remote.common.OutputDigestMismatchException;
+import com.google.devtools.build.lib.remote.common.ProducerActionKeyContext.SyntheticTestActionKey;
 import com.google.devtools.build.lib.remote.common.ProgressStatusListener;
 import com.google.devtools.build.lib.remote.common.RemoteActionExecutionContext;
 import com.google.devtools.build.lib.remote.common.RemoteActionExecutionContext.CachePolicy;
@@ -143,6 +145,7 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
@@ -192,6 +195,11 @@ public class RemoteExecutionService {
   @Nullable private final Path captureCorruptedOutputsDir;
   private final Cache<Object, CompletableFuture<MerkleTree>> merkleTreeCache;
   private final Set<String> reportedErrors = new HashSet<>();
+  private final Map<ActionExecutionMetadata, RegisteredSyntheticTestActionKey>
+      syntheticTestActionKeys = Collections.synchronizedMap(new IdentityHashMap<>());
+
+  private record RegisteredSyntheticTestActionKey(
+      SyntheticTestActionKey key, boolean debugEnabled) {}
 
   @SuppressWarnings("AllowVirtualThreads")
   private final ExecutorService backgroundTaskExecutor =
@@ -674,6 +682,9 @@ public class RemoteExecutionService {
 
       ActionKey actionKey = digestUtil.computeActionKey(action);
 
+      RegisteredSyntheticTestActionKey registeredSyntheticTestActionKey =
+          syntheticTestActionKeys.get(spawn.getResourceOwner());
+
       RequestMetadata metadata =
           TracingMetadataUtils.buildMetadata(
               buildRequestId, commandId, actionKey.getDigest().getHash(), spawn.getResourceOwner());
@@ -691,6 +702,9 @@ public class RemoteExecutionService {
           command,
           action,
           actionKey,
+          registeredSyntheticTestActionKey == null ? null : registeredSyntheticTestActionKey.key(),
+          registeredSyntheticTestActionKey != null
+              && registeredSyntheticTestActionKey.debugEnabled(),
           remoteOptions.remoteDiscardMerkleTrees);
     } finally {
       maybeReleaseRemoteActionBuildingSemaphore();
@@ -699,6 +713,17 @@ public class RemoteExecutionService {
 
   DigestUtil getDigestUtilForProducerKeyedTestCache() {
     return digestUtil;
+  }
+
+  void registerSyntheticTestActionKey(
+      ActionExecutionMetadata action,
+      SyntheticTestActionKey syntheticActionKey,
+      boolean debugEnabled) {
+    if (!remoteOptions.producerKeyedTestCacheWriteAliases) {
+      return;
+    }
+    syntheticTestActionKeys.put(
+        action, new RegisteredSyntheticTestActionKey(syntheticActionKey, debugEnabled));
   }
 
   @Nullable
@@ -1539,6 +1564,8 @@ public class RemoteExecutionService {
                 action.getActionKey(),
                 result.actionResult));
       }
+
+      uploadSyntheticTestActionAlias(action, result.actionResult);
     }
 
     if (inMemoryOutput != null && inMemoryOutputData.get() != null) {
@@ -1832,18 +1859,17 @@ public class RemoteExecutionService {
 
       return UploadManifest.create(
           remoteOptions,
-                combinedCache.getRemoteCacheCapabilities(),
-                digestUtil,
-                action.getRemotePathResolver(),
-                action.getActionKey(),
-                action.getAction(),
-                action.getCommand(),
-                outputFiles.build(),
-                action.getSpawnExecutionContext().getFileOutErr(),
-                spawnResult.exitCode(),
-                spawnResult.getStartTime(),
-                spawnResult.getWallTimeInMs());
-
+          combinedCache.getRemoteCacheCapabilities(),
+          digestUtil,
+          action.getRemotePathResolver(),
+          action.getActionKey(),
+          action.getAction(),
+          action.getCommand(),
+          outputFiles.build(),
+          action.getSpawnExecutionContext().getFileOutErr(),
+          spawnResult.exitCode(),
+          spawnResult.getStartTime(),
+          spawnResult.getWallTimeInMs());
     }
   }
 
@@ -1898,12 +1924,61 @@ public class RemoteExecutionService {
     try (SilentCloseable c =
         Profiler.instance().profile(ProfilerTask.UPLOAD_TIME, "upload outputs")) {
       UploadManifest manifest = buildUploadManifest(action, spawnResult);
-      var unused =
+      ActionResult actionResult =
           manifest.upload(action.getRemoteActionExecutionContext(), combinedCache, reporter);
+      uploadSyntheticTestActionAlias(action, actionResult);
     } catch (IOException e) {
       reportUploadError(e);
     } finally {
       onUploadComplete.run();
+    }
+  }
+
+  private void uploadSyntheticTestActionAlias(RemoteAction action, ActionResult actionResult)
+      throws InterruptedException {
+    SyntheticTestActionKey syntheticActionKey = action.getSyntheticTestActionKey();
+    if (syntheticActionKey == null
+        || combinedCache == null
+        || action.getAction().getDoNotCache()
+        || !action.getRemoteActionExecutionContext().getWriteCachePolicy().allowAnyCache()) {
+      return;
+    }
+
+    RemoteActionExecutionContext context = action.getRemoteActionExecutionContext();
+    try {
+      waitForBulkTransfer(
+          ImmutableList.of(
+              combinedCache.uploadBlob(
+                  context,
+                  syntheticActionKey.actionKey().getDigest(),
+                  syntheticActionKey.action().toByteString()),
+              combinedCache.uploadBlob(
+                  context,
+                  syntheticActionKey.action().getCommandDigest(),
+                  syntheticActionKey.command().toByteString()),
+              combinedCache.uploadBlob(
+                  context,
+                  syntheticActionKey.action().getInputRootDigest(),
+                  syntheticActionKey.inputRoot().toByteString())));
+      getFromFuture(
+          combinedCache.uploadActionResult(context, syntheticActionKey.actionKey(), actionResult));
+      if (action.isProducerKeyedDebugEnabled()) {
+        report(
+            Event.info(
+                "producer-keyed test cache: alias written early_key="
+                    + syntheticActionKey.actionKey().getDigest().getHash()));
+      }
+    } catch (InterruptedException e) {
+      throw e;
+    } catch (Exception e) {
+      if (action.isProducerKeyedDebugEnabled()) {
+        report(
+            Event.warn(
+                "producer-keyed test cache: alias upload failed early_key="
+                    + syntheticActionKey.actionKey().getDigest().getHash()
+                    + ": "
+                    + grpcAwareErrorMessage(e, verboseFailures)));
+      }
     }
   }
 

@@ -2934,6 +2934,32 @@ while offset < len(data):
 PY
   )
   assert_equals "$executed_producer_digest" "$reported_producer_digest"
+
+  reported_early_key=$(
+    sed -n 's/.* early_key=\([0-9a-f]*\).*/\1/p' "$TEST_log" | tail -1
+  )
+  [[ ! -f "$cas_path/ac/${reported_early_key:0:2}/$reported_early_key" ]] \
+    || fail "Compute-only mode unexpectedly wrote the producer-keyed alias"
+
+  bazel clean
+
+  bazel test \
+    --execution_log_json_file=producer_keyed_write_alias.json \
+    --experimental_producer_keyed_test_cache \
+    --experimental_producer_keyed_test_cache_write_aliases \
+    --experimental_producer_keyed_test_cache_debug \
+    --remote_cache=grpc://localhost:${worker_port} \
+    --remote_executor=grpc://localhost:${worker_port} \
+    --spawn_strategy=remote,local \
+    --test_strategy=standalone \
+    //producer_keyed_test:test >& $TEST_log \
+    || fail "Failed to write the producer-keyed test cache alias"
+
+  expect_log "producer-keyed test cache: alias written early_key=$reported_early_key"
+  [[ -f "$cas_path/ac/${reported_early_key:0:2}/$reported_early_key" ]] \
+    || fail "Producer-keyed alias was not present in the remote action cache"
+  grep -q '"mnemonic": "GoLink"' producer_keyed_write_alias.json \
+    || fail "Write-only mode unexpectedly skipped GoLink"
 }
 
 # Bazel assumes that non-ASCII characters in file contents (and, in

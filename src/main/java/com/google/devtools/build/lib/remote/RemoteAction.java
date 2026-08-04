@@ -21,6 +21,7 @@ import com.google.devtools.build.lib.actions.ForbiddenActionInputException;
 import com.google.devtools.build.lib.actions.Spawn;
 import com.google.devtools.build.lib.exec.SpawnRunner.SpawnExecutionContext;
 import com.google.devtools.build.lib.remote.common.NetworkTime;
+import com.google.devtools.build.lib.remote.common.ProducerActionKeyContext.SyntheticTestActionKey;
 import com.google.devtools.build.lib.remote.common.RemoteActionExecutionContext;
 import com.google.devtools.build.lib.remote.common.RemoteCacheClient.ActionKey;
 import com.google.devtools.build.lib.remote.common.RemotePathResolver;
@@ -48,6 +49,8 @@ public class RemoteAction {
   private final Command command;
   private final Action action;
   private final ActionKey actionKey;
+  @Nullable private final SyntheticTestActionKey syntheticTestActionKey;
+  private final boolean producerKeyedDebugEnabled;
 
   RemoteAction(
       Spawn spawn,
@@ -59,6 +62,8 @@ public class RemoteAction {
       Command command,
       Action action,
       ActionKey actionKey,
+      @Nullable SyntheticTestActionKey syntheticTestActionKey,
+      boolean producerKeyedDebugEnabled,
       boolean remoteDiscardMerkleTrees) {
     this.spawn = spawn;
     this.spawnExecutionContext = spawnExecutionContext;
@@ -71,6 +76,8 @@ public class RemoteAction {
     this.command = command;
     this.action = action;
     this.actionKey = actionKey;
+    this.syntheticTestActionKey = syntheticTestActionKey;
+    this.producerKeyedDebugEnabled = producerKeyedDebugEnabled;
   }
 
   public RemoteActionExecutionContext getRemoteActionExecutionContext() {
@@ -106,6 +113,15 @@ public class RemoteAction {
   /** Returns the {@link ActionKey} of this action. */
   public ActionKey getActionKey() {
     return actionKey;
+  }
+
+  @Nullable
+  public SyntheticTestActionKey getSyntheticTestActionKey() {
+    return syntheticTestActionKey;
+  }
+
+  public boolean isProducerKeyedDebugEnabled() {
+    return producerKeyedDebugEnabled;
   }
 
   /** Returns underlying {@link Action} of this remote action. */

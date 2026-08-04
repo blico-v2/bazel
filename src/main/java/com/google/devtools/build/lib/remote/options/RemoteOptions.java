@@ -50,6 +50,17 @@ import java.util.SortedMap;
 public final class RemoteOptions extends CommonRemoteOptions {
 
   @Option(
+      name = "experimental_producer_keyed_test_cache_write_aliases",
+      defaultValue = "false",
+      documentationCategory = OptionDocumentationCategory.UNDOCUMENTED,
+      effectTags = {OptionEffectTag.EXECUTION},
+      metadataTags = {OptionMetadataTag.EXPERIMENTAL},
+      help =
+          "Write producer-keyed aliases after successful normal test results. Requires "
+              + "--experimental_producer_keyed_test_cache and never reads the aliases.")
+  public boolean producerKeyedTestCacheWriteAliases;
+
+  @Option(
       name = "remote_proxy",
       oldName = "remote_cache_proxy",
       defaultValue = "null",

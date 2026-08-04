@@ -230,6 +230,27 @@ PY
   [[ -n "$producer_compute_ms" && -n "$runfiles_compute_ms" && -n "$synthetic_compute_ms" ]] \
     || fail "Missing producer-keyed timing diagnostics"
 
+  [[ ! -f "$cas_path/ac/${baseline_key:0:2}/$baseline_key" ]] \
+    || fail "Compute-only rules_go baseline unexpectedly wrote an alias"
+  bazel clean >& /dev/null
+  bazel test \
+    --experimental_producer_keyed_test_cache \
+    --experimental_producer_keyed_test_cache_write_aliases \
+    --experimental_producer_keyed_test_cache_debug \
+    --execution_log_json_file=write_alias.json \
+    --remote_cache="grpc://localhost:${worker_port}" \
+    --remote_executor="grpc://localhost:${worker_port}" \
+    --spawn_strategy=remote,local \
+    --test_strategy=standalone \
+    //pkg:pkg_test >& "$TEST_log" \
+    || fail "Failed to write the real rules_go producer-keyed alias"
+  assert_equals "$baseline_key" "$(extract_early_keys)"
+  expect_log "producer-keyed test cache: alias written early_key=$baseline_key"
+  [[ -f "$cas_path/ac/${baseline_key:0:2}/$baseline_key" ]] \
+    || fail "Real rules_go alias was not present in the remote action cache"
+  grep -q '"mnemonic": "GoLink"' write_alias.json \
+    || fail "Write-only rules_go mode unexpectedly skipped GoLink"
+
   local stable_key noop_source_key source_key data_key linkopts_key args_key env_key run_under_key
   stable_key="$(run_clean_key //pkg:pkg_test)"
   assert_equals "$baseline_key" "$stable_key"

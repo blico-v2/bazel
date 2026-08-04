@@ -17,8 +17,11 @@ package com.google.devtools.build.lib.remote;
 import static com.google.common.util.concurrent.Futures.immediateVoidFuture;
 
 import build.bazel.remote.execution.v2.Action;
+import build.bazel.remote.execution.v2.Command;
+import build.bazel.remote.execution.v2.Directory;
 import com.google.common.util.concurrent.ListenableFuture;
 import com.google.devtools.build.lib.actions.ActionContext;
+import com.google.devtools.build.lib.actions.ActionExecutionMetadata;
 import com.google.devtools.build.lib.actions.ActionInput;
 import com.google.devtools.build.lib.actions.ArtifactExpander;
 import com.google.devtools.build.lib.actions.ArtifactPathResolver;
@@ -31,6 +34,7 @@ import com.google.devtools.build.lib.exec.SpawnInputExpander;
 import com.google.devtools.build.lib.exec.SpawnRunner.ProgressStatus;
 import com.google.devtools.build.lib.exec.SpawnRunner.SpawnExecutionContext;
 import com.google.devtools.build.lib.remote.common.ProducerActionKeyContext;
+import com.google.devtools.build.lib.remote.common.ProducerActionKeyContext.SyntheticTestActionKey;
 import com.google.devtools.build.lib.remote.common.RemoteCacheClient.ActionKey;
 import com.google.devtools.build.lib.util.io.FileOutErr;
 import com.google.devtools.build.lib.vfs.FileSystem;
@@ -39,6 +43,7 @@ import com.google.devtools.build.lib.vfs.PathFragment;
 import com.google.protobuf.ByteString;
 import java.io.IOException;
 import java.time.Duration;
+import java.util.HexFormat;
 import java.util.SortedMap;
 import javax.annotation.Nullable;
 
@@ -66,16 +71,31 @@ final class RemoteProducerActionKeyContext implements ProducerActionKeyContext {
   }
 
   @Override
-  public ActionKey computeSyntheticTestActionKey(
+  public SyntheticTestActionKey computeSyntheticTestActionKey(
       ByteString logicalIdentity, ActionKey producerActionKey) {
     var digestUtil = remoteExecutionService.getDigestUtilForProducerKeyedTestCache();
+    Command command =
+        Command.newBuilder()
+            .addArguments("bazel.producer_keyed_test_cache.v1")
+            .addArguments(HexFormat.of().formatHex(logicalIdentity.toByteArray()))
+            .build();
+    Directory inputRoot = Directory.getDefaultInstance();
     Action syntheticAction =
         Action.newBuilder()
-            .setCommandDigest(digestUtil.compute(logicalIdentity.toByteArray()))
-            .setInputRootDigest(producerActionKey.getDigest())
+            .setCommandDigest(digestUtil.compute(command))
+            .setInputRootDigest(digestUtil.compute(inputRoot))
             .setSalt(ByteString.copyFromUtf8("bazel.producer_keyed_test_cache.v1"))
             .build();
-    return digestUtil.computeActionKey(syntheticAction);
+    return new SyntheticTestActionKey(
+        digestUtil.computeActionKey(syntheticAction), syntheticAction, command, inputRoot);
+  }
+
+  @Override
+  public void registerSyntheticTestActionKey(
+      ActionExecutionMetadata action,
+      SyntheticTestActionKey syntheticActionKey,
+      boolean debugEnabled) {
+    remoteExecutionService.registerSyntheticTestActionKey(action, syntheticActionKey, debugEnabled);
   }
 
   private final class DigestOnlySpawnExecutionContext implements SpawnExecutionContext {

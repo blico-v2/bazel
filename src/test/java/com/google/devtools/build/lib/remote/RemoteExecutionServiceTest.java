@@ -34,9 +34,11 @@ import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import build.bazel.remote.execution.v2.Action;
 import build.bazel.remote.execution.v2.ActionCacheUpdateCapabilities;
 import build.bazel.remote.execution.v2.ActionResult;
 import build.bazel.remote.execution.v2.CacheCapabilities;
+import build.bazel.remote.execution.v2.Command;
 import build.bazel.remote.execution.v2.Digest;
 import build.bazel.remote.execution.v2.Directory;
 import build.bazel.remote.execution.v2.DirectoryNode;
@@ -100,7 +102,9 @@ import com.google.devtools.build.lib.remote.CombinedCache.CachedActionResult;
 import com.google.devtools.build.lib.remote.RemoteExecutionService.RemoteActionResult;
 import com.google.devtools.build.lib.remote.RemoteScrubbing.Config;
 import com.google.devtools.build.lib.remote.common.BulkTransferException;
+import com.google.devtools.build.lib.remote.common.ProducerActionKeyContext.SyntheticTestActionKey;
 import com.google.devtools.build.lib.remote.common.RemoteActionExecutionContext;
+import com.google.devtools.build.lib.remote.common.RemoteCacheClient.ActionKey;
 import com.google.devtools.build.lib.remote.common.RemoteCacheClient.Blob;
 import com.google.devtools.build.lib.remote.common.RemoteExecutionClient;
 import com.google.devtools.build.lib.remote.common.RemotePathResolver;
@@ -2063,6 +2067,73 @@ public class RemoteExecutionServiceTest {
   }
 
   @Test
+  public void uploadOutputs_withSyntheticTestKey_writesAliasAfterPrimaryResult() throws Exception {
+    remoteOptions.producerKeyedTestCacheWriteAliases = true;
+    RemoteExecutionService service = newRemoteExecutionService();
+    FakeOwner owner = new FakeOwner("TestRunner", "Testing", "//dummy:test");
+    Spawn spawn = newSpawn(owner, ImmutableMap.of());
+    SyntheticTestActionKey syntheticTestActionKey = createSyntheticTestActionKey("identity");
+    service.registerSyntheticTestActionKey(owner, syntheticTestActionKey, /* debugEnabled= */ true);
+    RemoteAction action = service.buildRemoteAction(spawn, newSpawnExecutionContext(spawn));
+    SpawnResult spawnResult =
+        new SpawnResult.Builder()
+            .setExitCode(0)
+            .setStatus(Status.SUCCESS)
+            .setRunnerName("test")
+            .build();
+
+    uploadOutputsAndWait(service, action, spawnResult);
+
+    CachedActionResult alias =
+        cache.downloadActionResult(
+            action.getRemoteActionExecutionContext(),
+            syntheticTestActionKey.actionKey(),
+            /* inlineOutErr= */ false,
+            ImmutableSet.of());
+    assertThat(alias).isNotNull();
+    assertThat(alias.actionResult().getExitCode()).isEqualTo(0);
+    assertThat(eventHandler.getEvents())
+        .containsExactly(
+            Event.info(
+                "producer-keyed test cache: alias written early_key="
+                    + syntheticTestActionKey.actionKey().getDigest().getHash()));
+  }
+
+  @Test
+  public void uploadOutputs_syntheticAliasUploadFails_successfulResultIsPreserved()
+      throws Exception {
+    remoteOptions.producerKeyedTestCacheWriteAliases = true;
+    RemoteExecutionService service = newRemoteExecutionService();
+    FakeOwner owner = new FakeOwner("TestRunner", "Testing", "//dummy:test");
+    Spawn spawn = newSpawn(owner, ImmutableMap.of());
+    SyntheticTestActionKey syntheticTestActionKey = createSyntheticTestActionKey("identity");
+    service.registerSyntheticTestActionKey(owner, syntheticTestActionKey, /* debugEnabled= */ true);
+    RemoteAction action = service.buildRemoteAction(spawn, newSpawnExecutionContext(spawn));
+    SpawnResult spawnResult =
+        new SpawnResult.Builder()
+            .setExitCode(0)
+            .setStatus(Status.SUCCESS)
+            .setRunnerName("test")
+            .build();
+    doAnswer(
+            invocation -> {
+              ActionKey key = invocation.getArgument(1);
+              if (key.equals(syntheticTestActionKey.actionKey())) {
+                return Futures.immediateFailedFuture(new IOException("alias cache down"));
+              }
+              return invocation.callRealMethod();
+            })
+        .when(cache)
+        .uploadActionResult(any(), any(), any());
+
+    uploadOutputsAndWait(service, action, spawnResult);
+
+    assertThat(eventHandler.getEvents()).hasSize(1);
+    assertThat(eventHandler.getEvents().get(0).getKind()).isEqualTo(EventKind.WARNING);
+    assertThat(eventHandler.getEvents().get(0).getMessage()).contains("alias cache down");
+  }
+
+  @Test
   public void uploadOutputs_firesUploadEvents() throws Exception {
     Digest digest =
         fakeFileCache.createScratchInput(ActionInputHelper.fromPath("outputs/file"), "content");
@@ -2644,6 +2715,30 @@ public class RemoteExecutionServiceTest {
   private Spawn newSpawn(
       ImmutableMap<String, String> executionInfo, ImmutableSet<Artifact> outputs) {
     return newSpawn(executionInfo, outputs, NestedSetBuilder.emptySet(Order.STABLE_ORDER));
+  }
+
+  private Spawn newSpawn(FakeOwner owner, ImmutableMap<String, String> executionInfo) {
+    return new SimpleSpawn(
+        owner,
+        /* arguments= */ ImmutableList.of(),
+        /* environment= */ ImmutableMap.of(),
+        executionInfo,
+        /* inputs= */ NestedSetBuilder.emptySet(Order.STABLE_ORDER),
+        /* outputs= */ ImmutableSet.of(),
+        ResourceSet.ZERO);
+  }
+
+  private SyntheticTestActionKey createSyntheticTestActionKey(String identity) {
+    Command command = Command.newBuilder().addArguments(identity).build();
+    Directory inputRoot = Directory.getDefaultInstance();
+    Action action =
+        Action.newBuilder()
+            .setCommandDigest(digestUtil.compute(command))
+            .setInputRootDigest(digestUtil.compute(inputRoot))
+            .setSalt(ByteString.copyFromUtf8("bazel.producer_keyed_test_cache.v1"))
+            .build();
+    return new SyntheticTestActionKey(
+        digestUtil.computeActionKey(action), action, command, inputRoot);
   }
 
   private Spawn newSpawn(
