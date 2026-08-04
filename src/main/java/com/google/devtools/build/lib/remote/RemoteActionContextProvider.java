@@ -225,10 +225,12 @@ final class RemoteActionContextProvider {
             getRemoteExecutionService(),
             digestUtil);
     registryBuilder.register(SpawnCache.class, spawnCache, "remote-cache");
-    registryBuilder.register(
-        ProducerActionKeyContext.class,
-        new RemoteProducerActionKeyContext(getRemoteExecutionService(), env.getExecRoot()),
-        "producer-action-key");
+    if (combinedCache != null) {
+      registryBuilder.register(
+          ProducerActionKeyContext.class,
+          new RemoteProducerActionKeyContext(getRemoteExecutionService(), env.getExecRoot()),
+          "producer-action-key");
+    }
   }
 
   CombinedCache getCombinedCache() {
