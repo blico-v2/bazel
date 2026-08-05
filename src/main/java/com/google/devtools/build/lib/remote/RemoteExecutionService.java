@@ -111,6 +111,7 @@ import com.google.devtools.build.lib.remote.common.RemotePathResolver;
 import com.google.devtools.build.lib.remote.merkletree.MerkleTree;
 import com.google.devtools.build.lib.remote.options.RemoteOptions;
 import com.google.devtools.build.lib.remote.options.RemoteOptions.ConcurrentChangesCheckLevel;
+import com.google.devtools.build.lib.remote.options.RemoteOutputsMode;
 import com.google.devtools.build.lib.remote.salt.CacheSalt;
 import com.google.devtools.build.lib.remote.util.DigestUtil;
 import com.google.devtools.build.lib.remote.util.TracingMetadataUtils;
@@ -173,6 +174,9 @@ import javax.annotation.Nullable;
  * cache and execution with spawn specific types.
  */
 public class RemoteExecutionService {
+  private static final ByteString METADATA_ONLY_ACTION_SALT =
+      ByteString.copyFromUtf8("bazel.remote_cache_metadata_only.v1\u0000");
+
   private final Reporter reporter;
   private final boolean verboseFailures;
   private final Path execRoot;
@@ -897,6 +901,37 @@ public class RemoteExecutionService {
             /* inlineOutErr= */ false,
             inlineOutputFiles);
 
+    if (cachedActionResult == null && shouldUseMetadataOnlyRecord(action)) {
+      ActionKey metadataActionKey = metadataOnlyActionKey(action);
+      CachedActionResult metadataRecord =
+          combinedCache.downloadActionResult(
+              action.getRemoteActionExecutionContext(),
+              metadataActionKey,
+              /* inlineOutErr= */ false,
+              ImmutableSet.of());
+      if (metadataRecord != null && !metadataRecord.actionResult().getStdoutRaw().isEmpty()) {
+        try {
+          ActionResult outputMetadata =
+              ActionResult.parseFrom(metadataRecord.actionResult().getStdoutRaw());
+          cachedActionResult =
+              new CachedActionResult(outputMetadata, metadataRecord.cacheName());
+          report(
+              Event.info(
+                  "remote cache: metadata-only action result hit mnemonic="
+                      + action.getSpawn().getMnemonic()
+                      + " action_key="
+                      + action.getActionKey().digest().getHash()));
+        } catch (IOException e) {
+          report(
+              Event.warn(
+                  "remote cache: invalid metadata-only action result mnemonic="
+                      + action.getSpawn().getMnemonic()
+                      + ": "
+                      + e.getMessage()));
+        }
+      }
+    }
+
     if (cachedActionResult == null) {
       return null;
     }
@@ -925,6 +960,25 @@ public class RemoteExecutionService {
     }
 
     return result;
+  }
+
+  private boolean shouldUseMetadataOnlyRecord(RemoteAction action) {
+    return remoteOptions.getRemoteOutputsMode() == RemoteOutputsMode.MINIMAL
+        && remoteOptions.getRemoteCacheMetadataOnlyMnemonics().contains(
+            action.getSpawn().getMnemonic())
+        && getInMemoryOutputPath(action.getSpawn()) == null;
+  }
+
+  private Action metadataOnlyAction(RemoteAction action) {
+    return action
+        .getAction()
+        .toBuilder()
+        .setSalt(METADATA_ONLY_ACTION_SALT.concat(action.getAction().getSalt()))
+        .build();
+  }
+
+  private ActionKey metadataOnlyActionKey(RemoteAction action) {
+    return digestUtil.computeActionKey(metadataOnlyAction(action));
   }
 
   /**
@@ -1912,6 +1966,25 @@ public class RemoteExecutionService {
     try (SilentCloseable c =
         Profiler.instance().profile(ProfilerTask.UPLOAD_TIME, "upload outputs")) {
       UploadManifest manifest = buildUploadManifest(action, spawnResult);
+      if (shouldUseMetadataOnlyRecord(action)) {
+        Action metadataAction = metadataOnlyAction(action);
+        ActionKey metadataActionKey = digestUtil.computeActionKey(metadataAction);
+        manifest.uploadMetadataOnly(
+            action.getRemoteActionExecutionContext(),
+            combinedCache,
+            reporter,
+            metadataAction,
+            metadataActionKey);
+        report(
+            Event.info(
+                "remote cache: metadata-only action result uploaded mnemonic="
+                    + action.getSpawn().getMnemonic()
+                    + " action_key="
+                    + action.getActionKey().digest().getHash()
+                    + " metadata_key="
+                    + metadataActionKey.digest().getHash()));
+        return;
+      }
       var unused =
           manifest.upload(action.getRemoteActionExecutionContext(), combinedCache, reporter);
     } catch (IOException e) {
