@@ -550,7 +550,7 @@ public final class ActionExecutionFunction implements SkyFunction {
             .sorted(Comparator.comparing(Artifact::getExecPathString))
             .toList()) {
       FileArtifactValue metadata = checkedInputs.actionInputMap.getInputMetadata(input);
-      if (metadata == null || input.isTreeArtifact()) {
+      if (metadata == null) {
         return true;
       }
       fingerprint.addString(input.getExecPathString());
