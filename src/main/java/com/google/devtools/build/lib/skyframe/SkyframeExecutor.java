@@ -111,6 +111,7 @@ import com.google.devtools.build.lib.analysis.config.CoreOptions;
 import com.google.devtools.build.lib.analysis.config.InvalidConfigurationException;
 import com.google.devtools.build.lib.analysis.config.StarlarkExecTransitionLoader;
 import com.google.devtools.build.lib.analysis.config.StarlarkExecTransitionLoader.StarlarkExecTransitionLoadingException;
+import com.google.devtools.build.lib.analysis.test.TestConfiguration.TestOptions;
 import com.google.devtools.build.lib.analysis.constraints.RuleContextConstraintSemantics;
 import com.google.devtools.build.lib.analysis.platform.PlatformFunction;
 import com.google.devtools.build.lib.analysis.producers.ConfiguredTargetAndDataProducer;
@@ -1713,9 +1714,9 @@ public abstract class SkyframeExecutor implements WalkableGraphFactory {
     try {
       setExecutionProgressReceiver(executionProgressReceiver);
       Set<ConfiguredTarget> testsToRun = Sets.union(parallelTests, exclusiveTests);
-      RemoteOptions remoteOptions = options.getOptions(RemoteOptions.class);
+      TestOptions testOptions = options.getOptions(TestOptions.class);
       boolean producerKeyedCacheEnabled =
-          testOptions != null && testOptions.getExperimentalProducerKeyedTestCache();
+          testOptions != null && testOptions.experimentalProducerKeyedTestCache;
       ImmutableSet<ActionLookupKey> testLookupKeys =
           testsToRun.stream()
               .map(ConfiguredTarget::getLookupKey)

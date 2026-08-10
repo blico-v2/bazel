@@ -82,6 +82,7 @@ import com.google.devtools.build.lib.actions.UserExecException;
 import com.google.devtools.build.lib.actions.cache.MetadataInjector;
 import com.google.devtools.build.lib.actions.cache.OutputMetadataStore;
 import com.google.devtools.build.lib.analysis.config.CoreOptions;
+import com.google.devtools.build.lib.analysis.test.TestConfiguration.TestOptions;
 import com.google.devtools.build.lib.bugreport.BugReport;
 import com.google.devtools.build.lib.buildeventstream.BuildEventProtocolOptions;
 import com.google.devtools.build.lib.buildtool.BuildRequestOptions;
@@ -377,8 +378,8 @@ public final class SkyframeActionExecutor {
   }
 
   boolean producerKeyedTestCacheEnabled() {
-    RemoteOptions remoteOptions = options.getOptions(RemoteOptions.class);
-    return remoteOptions != null && remoteOptions.producerKeyedTestCacheEnabled;
+    TestOptions testOptions = options.getOptions(TestOptions.class);
+    return testOptions != null && testOptions.experimentalProducerKeyedTestCache;
   }
 
   boolean wasProducerKeyedEarlyCacheHit(Action action) {

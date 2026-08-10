@@ -50,19 +50,21 @@ import com.google.devtools.build.lib.actions.ActionLookupData;
 import com.google.devtools.build.lib.actions.Actions;
 import com.google.devtools.build.lib.actions.AlreadyReportedActionExecutionException;
 import com.google.devtools.build.lib.actions.Artifact;
+import com.google.devtools.build.lib.actions.Artifact.ArchivedTreeArtifact;
 import com.google.devtools.build.lib.actions.Artifact.DerivedArtifact;
+import com.google.devtools.build.lib.actions.Artifact.SpecialArtifact;
+import com.google.devtools.build.lib.actions.Artifact.TreeFileArtifact;
+import com.google.devtools.build.lib.actions.ArtifactExpander;
 import com.google.devtools.build.lib.actions.ArtifactPathResolver;
-import com.google.devtools.build.lib.actions.DelegatingPairInputMetadataProvider;
 import com.google.devtools.build.lib.actions.DiscoveredInputsEvent;
 import com.google.devtools.build.lib.actions.ExecutionRequirements;
 import com.google.devtools.build.lib.actions.FileArtifactValue;
 import com.google.devtools.build.lib.actions.FilesetOutputTree;
-import com.google.devtools.build.lib.actions.ForbiddenActionInputException;
 import com.google.devtools.build.lib.actions.InputMetadataProvider;
 import com.google.devtools.build.lib.actions.LostInputsActionExecutionException;
+import com.google.devtools.build.lib.actions.MiddlemanAction;
 import com.google.devtools.build.lib.actions.PackageRootResolver;
 import com.google.devtools.build.lib.actions.RunfilesTree;
-import com.google.devtools.build.lib.actions.RunfilesTreeAction;
 import com.google.devtools.build.lib.actions.SpawnMetrics;
 import com.google.devtools.build.lib.actions.cache.OutputMetadataStore;
 import com.google.devtools.build.lib.analysis.BlazeDirectories;
@@ -81,7 +83,6 @@ import com.google.devtools.build.lib.collect.nestedset.ArtifactNestedSetKey;
 import com.google.devtools.build.lib.collect.nestedset.NestedSet;
 import com.google.devtools.build.lib.collect.nestedset.NestedSetBuilder;
 import com.google.devtools.build.lib.collect.nestedset.Order;
-import com.google.devtools.build.lib.events.Event;
 import com.google.devtools.build.lib.io.InconsistentFilesystemException;
 import com.google.devtools.build.lib.packages.BuildFileNotFoundException;
 import com.google.devtools.build.lib.packages.semantics.BuildLanguageOptions;
@@ -89,6 +90,8 @@ import com.google.devtools.build.lib.profiler.Profiler;
 import com.google.devtools.build.lib.profiler.ProfilerTask;
 import com.google.devtools.build.lib.profiler.SilentCloseable;
 import com.google.devtools.build.lib.remote.common.ProducerKeyedTestCache;
+import com.google.devtools.build.lib.remote.common.LostInputsEvent;
+import com.google.devtools.build.lib.server.FailureDetails;
 import com.google.devtools.build.lib.server.FailureDetails.Execution;
 import com.google.devtools.build.lib.server.FailureDetails.Execution.Code;
 import com.google.devtools.build.lib.server.FailureDetails.FailureDetail;
@@ -126,6 +129,7 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -275,15 +279,9 @@ public final class ActionExecutionFunction implements SkyFunction {
       if (testConfiguration.experimentalProducerKeyedTestCache()) {
         state = env.getState(InputDiscoveryState::new);
         if (!state.producerKeyedIdentityComputed) {
-          if (!testAction.shouldAcceptCachedResult()) {
-            reportProducerKeyedTestCacheEligibility(
-                env, testConfiguration, testAction, "CACHE_POLICY_DISALLOWS");
-          } else {
+          if (testAction.shouldAcceptCachedResult()) {
             Artifact executable = testAction.getExecutionSettings().getExecutable();
-            if (!(executable instanceof DerivedArtifact derivedExecutable)) {
-              reportProducerKeyedTestCacheEligibility(
-                  env, testConfiguration, testAction, "EXECUTABLE_NOT_DERIVED");
-            } else {
+            if (executable instanceof DerivedArtifact derivedExecutable) {
               Action producer =
                   ActionUtils.getActionForLookupData(
                       env, derivedExecutable.getGeneratingActionKey());
@@ -504,7 +502,6 @@ public final class ActionExecutionFunction implements SkyFunction {
 
   private boolean computeProducerKeyedTestCacheKey(
       Environment env,
-      TestConfiguration configuration,
       TestRunnerAction testAction,
       SpawnAction producer,
       ImmutableMap<String, String> clientEnv,
@@ -538,12 +535,16 @@ public final class ActionExecutionFunction implements SkyFunction {
     if (checkedInputs == null || env.valuesMissing()) {
       return false;
     }
-    InputMetadataProvider producerMetadata =
-        new ActionInputMetadataProvider(checkedInputs.actionInputMap);
+    if (!checkedInputs.filesetsInsideRunfiles.isEmpty()
+        || !checkedInputs.topLevelFilesets.isEmpty()) {
+      return true;
+    }
     Fingerprint fingerprint = new Fingerprint();
     fingerprint.addString("bazel.producer_keyed_test_cache.v2");
     fingerprint.addString(
-        producer.getKey(skyframeActionExecutor.getActionKeyContext(), producerMetadata));
+        producer.getKey(
+            skyframeActionExecutor.getActionKeyContext(),
+            new ActionInputArtifactExpander(checkedInputs.actionInputMap, ImmutableMap.of())));
     for (Artifact input :
         producerInputs.toList().stream()
             .sorted(Comparator.comparing(Artifact::getExecPathString))
@@ -556,33 +557,40 @@ public final class ActionExecutionFunction implements SkyFunction {
       metadata.addTo(fingerprint);
     }
 
-    Artifact runfilesTreeArtifact = testAction.getRunfilesTree();
+    Artifact runfilesTreeArtifact = testAction.getRunfilesMiddleman();
     if (!(runfilesTreeArtifact instanceof DerivedArtifact derivedRunfilesTree)) {
       return true;
     }
     Action runfilesAction =
-        ActionUtils.getActionForLookupData(env, derivedRunfilesMiddleman.getGeneratingActionKey());
+        ActionUtils.getActionForLookupData(env, derivedRunfilesTree.getGeneratingActionKey());
     if (runfilesAction == null) {
       return false;
     }
     if (!(runfilesAction instanceof MiddlemanAction middlemanAction)) {
-      reportProducerKeyedTestCacheEligibility(
-          env, configuration, testAction, "UNSUPPORTED_RUNFILES_SHAPE");
       return true;
     }
 
     Artifact executable = testAction.getExecutionSettings().getExecutable();
-    RunfilesTree runfilesTree = runfilesTreeAction.getRunfilesTree();
-    runfilesTree.fingerprint(
-        skyframeActionExecutor.getActionKeyContext(), fingerprint, /* digestAbsolutePaths= */ false);
+    RunfilesTree runfilesTree = middlemanAction.getRunfilesTree();
+    runfilesTree.getMapping().entrySet().stream()
+        .sorted(Map.Entry.comparingByKey())
+        .forEach(
+            entry -> {
+              fingerprint.addPath(entry.getKey());
+              Artifact artifact = entry.getValue();
+              fingerprint.addNullableString(
+                  artifact == null
+                      ? null
+                      : artifact.equals(executable)
+                          ? "<producer>"
+                          : artifact.getExecPathString());
+            });
     ImmutableSet<Artifact> runfilesArtifacts =
         ImmutableSet.copyOf(runfilesTree.getArtifacts().toList());
     NestedSetBuilder<Artifact> logicalArtifacts = NestedSetBuilder.stableOrder();
     for (Artifact artifact : runfilesArtifacts) {
       if (!artifact.equals(executable)) {
         if (artifact.isTreeArtifact()) {
-          reportProducerKeyedTestCacheEligibility(
-              env, configuration, testAction, "UNSUPPORTED_RUNFILES_SHAPE: tree artifact");
           return true;
         }
         logicalArtifacts.add(artifact);
@@ -595,8 +603,6 @@ public final class ActionExecutionFunction implements SkyFunction {
         continue;
       }
       if (input.isTreeArtifact()) {
-        reportProducerKeyedTestCacheEligibility(
-            env, configuration, testAction, "UNSUPPORTED_RUNFILES_SHAPE: direct tree artifact");
         return true;
       }
       logicalArtifacts.add(input);
@@ -622,11 +628,16 @@ public final class ActionExecutionFunction implements SkyFunction {
     if (logicalInputResults == null || env.valuesMissing()) {
       return false;
     }
+    if (!logicalInputResults.filesetsInsideRunfiles.isEmpty()
+        || !logicalInputResults.topLevelFilesets.isEmpty()) {
+      return true;
+    }
 
-    InputMetadataProvider logicalMetadata =
-        new ActionInputMetadataProvider(logicalInputResults.actionInputMap);
     fingerprint.addString(
-        testAction.getKey(skyframeActionExecutor.getActionKeyContext(), logicalMetadata));
+        testAction.getKey(
+            skyframeActionExecutor.getActionKeyContext(),
+            new ActionInputArtifactExpander(
+                logicalInputResults.actionInputMap, ImmutableMap.of())));
     fingerprint.addStringMap(clientEnv);
     testAction.getOutputs().stream()
         .map(Artifact::getExecPathString)

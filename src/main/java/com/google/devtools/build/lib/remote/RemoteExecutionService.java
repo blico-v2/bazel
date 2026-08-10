@@ -95,8 +95,6 @@ import com.google.devtools.build.lib.profiler.Profiler;
 import com.google.devtools.build.lib.profiler.ProfilerTask;
 import com.google.devtools.build.lib.profiler.SilentCloseable;
 import com.google.devtools.build.lib.remote.CombinedCache.CachedActionResult;
-import com.google.devtools.build.lib.remote.RemoteAction.ShadowLookupResult;
-import com.google.devtools.build.lib.remote.RemoteAction.ShadowLookupStatus;
 import com.google.devtools.build.lib.remote.RemoteExecutionService.ActionResultMetadata.DirectoryMetadata;
 import com.google.devtools.build.lib.remote.RemoteExecutionService.ActionResultMetadata.FileMetadata;
 import com.google.devtools.build.lib.remote.RemoteExecutionService.ActionResultMetadata.SymlinkMetadata;
@@ -178,9 +176,6 @@ import javax.annotation.Nullable;
  * cache and execution with spawn specific types.
  */
 public class RemoteExecutionService implements ProducerKeyedTestCache {
-  private static final Comparator<String> PROTO_STRING_COMPARATOR =
-      comparing(StringEncoding::unicodeToInternal);
-
   private final Reporter reporter;
   private final boolean verboseFailures;
   private final Path execRoot;
@@ -703,7 +698,8 @@ public class RemoteExecutionService implements ProducerKeyedTestCache {
           commandHash,
           command,
           action,
-          actionKey);
+          actionKey,
+          remoteOptions.remoteDiscardMerkleTrees);
     } finally {
       maybeReleaseRemoteActionBuildingSemaphore();
     }
@@ -726,7 +722,7 @@ public class RemoteExecutionService implements ProducerKeyedTestCache {
     try {
       boolean allowRemoteCache =
           useRemoteCache()
-              && remoteOptions.getRemoteAcceptCached()
+              && remoteOptions.remoteAcceptCached
               && Spawns.mayBeCachedRemotely(action.getExecutionInfo());
       boolean allowDiskCache = useDiskCache() && Spawns.mayBeCached(action.getExecutionInfo());
       CachePolicy readPolicy = CachePolicy.create(allowRemoteCache, allowDiskCache);
@@ -745,15 +741,7 @@ public class RemoteExecutionService implements ProducerKeyedTestCache {
       return true;
     } catch (InterruptedException e) {
       throw e;
-    } catch (Exception e) {
-      if (registered.debugEnabled()) {
-        report(
-            Event.warn(
-                "producer-keyed test cache: early_restore=failed early_key="
-                    + registered.key().actionKey().getDigest().getHash()
-                    + ": "
-                    + grpcAwareErrorMessage(e, verboseFailures)));
-      }
+    } catch (Exception ignored) {
       return false;
     }
   }
@@ -857,14 +845,7 @@ public class RemoteExecutionService implements ProducerKeyedTestCache {
       CachePolicy writePolicy) {
     RequestMetadata metadata =
         TracingMetadataUtils.buildMetadata(
-            buildRequestId,
-            commandId,
-            key.digest().getHash(),
-            action.getMnemonic(),
-            action.getOwner().getLabel() == null
-                ? null
-                : action.getOwner().getLabel().getCanonicalForm(),
-            action.getOwner().getConfigurationChecksum());
+            buildRequestId, commandId, key.getDigest().getHash(), action);
     return RemoteActionExecutionContext.create(metadata)
         .withReadCachePolicy(readPolicy)
         .withWriteCachePolicy(writePolicy);
@@ -2109,7 +2090,8 @@ public class RemoteExecutionService implements ProducerKeyedTestCache {
               .map(output -> execRoot.getRelative(output.getExecPath()))
               .toList());
       ActionResult result = manifest.upload(context, combinedCache, reporter);
-      getFromFuture(combinedCache.uploadBlob(context, key.digest(), syntheticAction.toByteString()));
+      getFromFuture(
+          combinedCache.uploadBlob(context, key.getDigest(), syntheticAction.toByteString()));
       Command command = Command.getDefaultInstance();
       getFromFuture(
           combinedCache.uploadBlob(
@@ -2117,134 +2099,8 @@ public class RemoteExecutionService implements ProducerKeyedTestCache {
       getFromFuture(combinedCache.uploadActionResult(context, key, result));
     } catch (InterruptedException e) {
       throw e;
-    } catch (Exception e) {
-      if (registered.debugEnabled()) {
-        report(
-            Event.warn(
-                "producer-keyed test cache: alias finalization failed early_key="
-                    + registered.key().actionKey().getDigest().getHash()
-                    + ": "
-                    + grpcAwareErrorMessage(e, verboseFailures)));
-      }
+    } catch (Exception ignored) {
     }
-  }
-
-  @VisibleForTesting
-  void compareSyntheticTestActionShadowResult(
-      RemoteAction action,
-      ActionResult normalActionResult,
-      boolean normalCacheHit,
-      String normalSource) {
-    ShadowLookupResult shadowLookupResult = action.getShadowLookupResult();
-    String comparison = null;
-    boolean disagreement = false;
-    switch (shadowLookupResult.status()) {
-      case HIT -> {
-        ActionResult shadowActionResult = checkNotNull(shadowLookupResult.actionResult());
-        ImmutableSet<String> actionOutputPaths = ImmutableSet.of();
-        if (action.getSpawn().getResourceOwner() instanceof TestRunnerAction test) {
-          actionOutputPaths =
-              test.getOutputs().stream()
-                  .map(action.getRemotePathResolver()::localPathToOutputPath)
-                  .collect(ImmutableSet.toImmutableSet());
-        }
-        if (shadowActionResult.getExitCode() == 0 && normalActionResult.getExitCode() != 0) {
-          comparison = "early_pass_normal_fail";
-          disagreement = true;
-        } else if (canonicalizeShadowActionResult(shadowActionResult, actionOutputPaths)
-            .equals(canonicalizeShadowActionResult(normalActionResult, actionOutputPaths))) {
-          comparison = "match";
-        } else {
-          comparison = "result_mismatch";
-          disagreement = true;
-        }
-      }
-      case MISS -> {
-        if (normalCacheHit) {
-          comparison = "early_miss_normal_cache_hit";
-          disagreement = true;
-        }
-      }
-      case UNAVAILABLE -> {
-        comparison = "early_outputs_unavailable";
-        disagreement = true;
-      }
-      case NOT_ATTEMPTED, ERROR -> {
-        return;
-      }
-    }
-    if (comparison != null && action.isProducerKeyedDebugEnabled()) {
-      String message =
-          "producer-keyed test cache: shadow_compare="
-              + comparison
-              + " early_key="
-              + checkNotNull(action.getSyntheticTestActionKey()).actionKey().getDigest().getHash()
-              + " early_cache="
-              + Objects.toString(shadowLookupResult.cacheName(), "none")
-              + " normal_source="
-              + normalSource;
-      report(disagreement ? Event.warn(message) : Event.info(message));
-    }
-  }
-
-  void reportSyntheticTestActionShadowFailure(RemoteAction action, String normalSource) {
-    compareSyntheticTestActionShadowResult(
-        action,
-        ActionResult.newBuilder().setExitCode(1).build(),
-        /* normalCacheHit= */ false,
-        normalSource);
-  }
-
-  private ActionResult canonicalizeShadowActionResult(
-      ActionResult actionResult, ImmutableSet<String> ignoredOutputPaths) {
-    ActionResult.Builder builder = actionResult.toBuilder().clearExecutionMetadata();
-    ImmutableList<OutputFile> outputFiles =
-        actionResult.getOutputFilesList().stream()
-            .filter(outputFile -> !ignoredOutputPaths.contains(outputFile.getPath()))
-            .map(outputFile -> outputFile.toBuilder().clearContents().build())
-            .collect(ImmutableList.toImmutableList());
-    builder.clearOutputFiles().addAllOutputFiles(outputFiles);
-    builder
-        .clearOutputDirectories()
-        .addAllOutputDirectories(
-            actionResult.getOutputDirectoriesList().stream()
-                .filter(output -> !ignoredOutputPaths.contains(output.getPath()))
-                .toList());
-    builder
-        .clearOutputSymlinks()
-        .addAllOutputSymlinks(
-            actionResult.getOutputSymlinksList().stream()
-                .filter(output -> !ignoredOutputPaths.contains(output.getPath()))
-                .toList());
-    builder
-        .clearOutputFileSymlinks()
-        .addAllOutputFileSymlinks(
-            actionResult.getOutputFileSymlinksList().stream()
-                .filter(output -> !ignoredOutputPaths.contains(output.getPath()))
-                .toList());
-    builder
-        .clearOutputDirectorySymlinks()
-        .addAllOutputDirectorySymlinks(
-            actionResult.getOutputDirectorySymlinksList().stream()
-                .filter(output -> !ignoredOutputPaths.contains(output.getPath()))
-                .toList());
-    if (!actionResult.getStdoutRaw().isEmpty()) {
-      builder
-          .clearStdoutRaw()
-          .setStdoutDigest(digestUtil.compute(actionResult.getStdoutRaw().toByteArray()));
-    } else if (actionResult.hasStdoutDigest()
-        && actionResult.getStdoutDigest().getSizeBytes() == 0) {
-      builder.clearStdoutDigest();
-    }
-    if (!actionResult.getStderrRaw().isEmpty()) {
-      builder
-          .clearStderrRaw()
-          .setStderrDigest(digestUtil.compute(actionResult.getStderrRaw().toByteArray()));
-    } else if (actionResult.hasStderrDigest()
-        && actionResult.getStderrDigest().getSizeBytes() == 0) {
-      builder.clearStderrDigest();
-    }
-    return builder.build();
   }
 
   private void checkForConcurrentModifications(

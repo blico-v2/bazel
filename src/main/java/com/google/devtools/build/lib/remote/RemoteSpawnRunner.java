@@ -729,9 +729,6 @@ public class RemoteSpawnRunner implements SpawnRunner {
       // FULL is used here to retain historic behavior.
       remoteExecutionService.uploadOutputs(
           action, result, () -> {}, ConcurrentChangesCheckLevel.FULL);
-    } else if (result != null
-        && (!Status.SUCCESS.equals(result.status()) || result.exitCode() != 0)) {
-      remoteExecutionService.reportSyntheticTestActionShadowFailure(action, "local-fallback");
     }
     return result;
   }
