@@ -50,32 +50,23 @@ import com.google.devtools.build.lib.actions.ActionLookupData;
 import com.google.devtools.build.lib.actions.Actions;
 import com.google.devtools.build.lib.actions.AlreadyReportedActionExecutionException;
 import com.google.devtools.build.lib.actions.Artifact;
-import com.google.devtools.build.lib.actions.Artifact.ArchivedTreeArtifact;
 import com.google.devtools.build.lib.actions.Artifact.DerivedArtifact;
-import com.google.devtools.build.lib.actions.Artifact.SpecialArtifact;
-import com.google.devtools.build.lib.actions.Artifact.TreeFileArtifact;
-import com.google.devtools.build.lib.actions.ArtifactExpander;
 import com.google.devtools.build.lib.actions.ArtifactPathResolver;
-import com.google.devtools.build.lib.actions.CommandLineExpansionException;
+import com.google.devtools.build.lib.actions.DelegatingPairInputMetadataProvider;
 import com.google.devtools.build.lib.actions.DiscoveredInputsEvent;
-import com.google.devtools.build.lib.actions.ExecException;
+import com.google.devtools.build.lib.actions.ExecutionRequirements;
 import com.google.devtools.build.lib.actions.FileArtifactValue;
 import com.google.devtools.build.lib.actions.FilesetOutputTree;
 import com.google.devtools.build.lib.actions.ForbiddenActionInputException;
 import com.google.devtools.build.lib.actions.InputMetadataProvider;
 import com.google.devtools.build.lib.actions.LostInputsActionExecutionException;
-import com.google.devtools.build.lib.actions.MiddlemanAction;
 import com.google.devtools.build.lib.actions.PackageRootResolver;
 import com.google.devtools.build.lib.actions.RunfilesTree;
+import com.google.devtools.build.lib.actions.RunfilesTreeAction;
 import com.google.devtools.build.lib.actions.SpawnMetrics;
 import com.google.devtools.build.lib.actions.cache.OutputMetadataStore;
 import com.google.devtools.build.lib.analysis.BlazeDirectories;
-import com.google.devtools.build.lib.analysis.test.ProducerKeyedTestCacheEligibility;
-import com.google.devtools.build.lib.analysis.test.ProducerKeyedTestCacheEligibility.Eligible;
-import com.google.devtools.build.lib.analysis.test.ProducerKeyedTestCacheEligibility.Ineligible;
-import com.google.devtools.build.lib.analysis.test.ProducerKeyedTestIdentity;
-import com.google.devtools.build.lib.analysis.test.ProducerKeyedTestIdentity.DeclaredOutput;
-import com.google.devtools.build.lib.analysis.test.ProducerKeyedTestIdentity.LogicalInput;
+import com.google.devtools.build.lib.analysis.actions.SpawnAction;
 import com.google.devtools.build.lib.analysis.test.TestConfiguration;
 import com.google.devtools.build.lib.analysis.test.TestRunnerAction;
 import com.google.devtools.build.lib.bugreport.BugReport;
@@ -97,9 +88,7 @@ import com.google.devtools.build.lib.packages.semantics.BuildLanguageOptions;
 import com.google.devtools.build.lib.profiler.Profiler;
 import com.google.devtools.build.lib.profiler.ProfilerTask;
 import com.google.devtools.build.lib.profiler.SilentCloseable;
-import com.google.devtools.build.lib.remote.common.LostInputsEvent;
-import com.google.devtools.build.lib.remote.common.ProducerActionKeyContext;
-import com.google.devtools.build.lib.server.FailureDetails;
+import com.google.devtools.build.lib.remote.common.ProducerKeyedTestCache;
 import com.google.devtools.build.lib.server.FailureDetails.Execution;
 import com.google.devtools.build.lib.server.FailureDetails.Execution.Code;
 import com.google.devtools.build.lib.server.FailureDetails.FailureDetail;
@@ -116,6 +105,7 @@ import com.google.devtools.build.lib.skyframe.serialization.SkyValueRetriever.Se
 import com.google.devtools.build.lib.skyframe.serialization.analysis.RemoteAnalysisCachingDependenciesProvider;
 import com.google.devtools.build.lib.util.DetailedExitCode;
 import com.google.devtools.build.lib.util.DetailedExitCode.DetailedExitCodeComparator;
+import com.google.devtools.build.lib.util.Fingerprint;
 import com.google.devtools.build.lib.util.Pair;
 import com.google.devtools.build.lib.util.io.FileOutErr;
 import com.google.devtools.build.lib.util.io.TimestampGranularityMonitor;
@@ -131,16 +121,13 @@ import com.google.devtools.build.skyframe.SkyKey;
 import com.google.devtools.build.skyframe.SkyValue;
 import com.google.devtools.build.skyframe.SkyframeLookupResult;
 import com.google.errorprone.annotations.CanIgnoreReturnValue;
-import java.io.IOException;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Comparator;
 import java.util.HashMap;
-import java.util.HashSet;
-import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
-import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -303,19 +290,23 @@ public final class ActionExecutionFunction implements SkyFunction {
               if (producer == null) {
                 return null;
               }
-              switch (ProducerKeyedTestCacheEligibility.check(
-                  testAction,
-                  producer,
-                  testConfiguration.experimentalProducerKeyedTestCacheProducerMnemonics())) {
-                case Eligible eligible -> {
-                  if (!computeAndReportProducerActionKey(
-                      env, testConfiguration, testAction, eligible.producer(), clientEnv, state)) {
-                    return null;
-                  }
-                }
-                case Ineligible ineligible ->
-                    reportProducerKeyedTestCacheEligibility(
-                        env, testConfiguration, testAction, ineligible.reason().name());
+              if (producer instanceof SpawnAction spawnAction
+                  && testConfiguration
+                      .experimentalProducerKeyedTestCacheProducerMnemonics()
+                      .contains(producer.getMnemonic())
+                  && !producer.discoversInputs()
+                  && testAction.getOwner().getLabel() != null
+                  && testAction.getOwner().getLabel().equals(producer.getOwner().getLabel())
+                  && producer.getOutputs().size() == 1
+                  && producer.getOutputs().contains(executable)
+                  && !spawnAction
+                      .getExecutionInfo()
+                      .containsKey(ExecutionRequirements.NO_CACHE)
+                  && !producer.isVolatile()
+                  && !producer.executeUnconditionally()
+                  && !computeProducerKeyedTestCacheKey(
+                      env, testAction, spawnAction, clientEnv, state)) {
+                return null;
               }
             }
           }
@@ -511,32 +502,19 @@ public final class ActionExecutionFunction implements SkyFunction {
     return result;
   }
 
-  private static void reportProducerKeyedTestCacheEligibility(
-      Environment env, TestConfiguration configuration, TestRunnerAction action, String result) {
-    if (configuration.experimentalProducerKeyedTestCacheDebug()) {
-      env.getListener()
-          .handle(
-              Event.info(
-                  String.format(
-                      "producer-keyed test cache: %s: %s", action.getOwner().getLabel(), result)));
-    }
-  }
-
-  private boolean computeAndReportProducerActionKey(
+  private boolean computeProducerKeyedTestCacheKey(
       Environment env,
       TestConfiguration configuration,
       TestRunnerAction testAction,
-      com.google.devtools.build.lib.analysis.actions.SpawnAction producer,
+      SpawnAction producer,
       ImmutableMap<String, String> clientEnv,
       InputDiscoveryState state)
       throws InterruptedException, ActionExecutionFunctionException, UndoneInputsException {
-    long producerDigestStartNanos = BlazeClock.nanoTime();
-    ProducerActionKeyContext keyContext =
+    ProducerKeyedTestCache cache =
         skyframeActionExecutor
             .getActionContextRegistry()
-            .getContext(ProducerActionKeyContext.class);
-    if (keyContext == null) {
-      reportProducerKeyedTestCacheEligibility(env, configuration, testAction, "CACHE_UNCONFIGURED");
+            .getContext(ProducerKeyedTestCache.class);
+    if (cache == null) {
       return true;
     }
 
@@ -560,79 +538,26 @@ public final class ActionExecutionFunction implements SkyFunction {
     if (checkedInputs == null || env.valuesMissing()) {
       return false;
     }
-    if (!checkedInputs.filesetsInsideRunfiles.isEmpty()
-        || !checkedInputs.topLevelFilesets.isEmpty()) {
-      reportProducerKeyedTestCacheEligibility(
-          env, configuration, testAction, "UNSUPPORTED_PRODUCER_FILESETS");
-      return true;
-    }
-
-    ImmutableMap<Artifact, FilesetOutputTree> expandedFilesets =
-        ImmutableMap.<Artifact, FilesetOutputTree>builder()
-            .putAll(checkedInputs.filesetsInsideRunfiles)
-            .putAll(checkedInputs.topLevelFilesets)
-            .buildKeepingLast();
-    ArtifactExpander artifactExpander =
-        new ActionInputArtifactExpander(checkedInputs.actionInputMap, expandedFilesets);
-    ArtifactPathResolver pathResolver =
-        ArtifactPathResolver.createPathResolver(
-            /* actionFileSystem= */ null, skyframeActionExecutor.getExecRoot());
-    InputMetadataProvider inputMetadataProvider =
-        new ActionInputMetadataProvider(
-            skyframeActionExecutor.getExecRoot().asFragment(),
-            checkedInputs.actionInputMap,
-            expandedFilesets);
-    long producerInputBytes = 0;
-    for (Artifact input : producerInputs.toList()) {
+    InputMetadataProvider producerMetadata =
+        new ActionInputMetadataProvider(checkedInputs.actionInputMap);
+    Fingerprint fingerprint = new Fingerprint();
+    fingerprint.addString("bazel.producer_keyed_test_cache.v2");
+    fingerprint.addString(
+        producer.getKey(skyframeActionExecutor.getActionKeyContext(), producerMetadata));
+    for (Artifact input :
+        producerInputs.toList().stream()
+            .sorted(Comparator.comparing(Artifact::getExecPathString))
+            .toList()) {
       FileArtifactValue metadata = checkedInputs.actionInputMap.getInputMetadata(input);
-      if (metadata != null) {
-        producerInputBytes += metadata.getSize();
+      if (metadata == null || input.isTreeArtifact()) {
+        return true;
       }
+      fingerprint.addString(input.getExecPathString());
+      metadata.addTo(fingerprint);
     }
-    try {
-      var spawn = producer.getSpawnForActionKey(clientEnv, artifactExpander);
-      var actionKey =
-          keyContext.computeActionKey(spawn, inputMetadataProvider, artifactExpander, pathResolver);
-      return computeAndReportSyntheticTestKey(
-          env,
-          configuration,
-          testAction,
-          clientEnv,
-          keyContext,
-          actionKey,
-          producer.getMnemonic(),
-          producerInputs.toList().size(),
-          producerInputBytes,
-          Duration.ofNanos(BlazeClock.nanoTime() - producerDigestStartNanos).toMillis(),
-          state);
-    } catch (IOException
-        | ExecException
-        | CommandLineExpansionException
-        | ForbiddenActionInputException e) {
-      reportProducerKeyedTestCacheEligibility(
-          env, configuration, testAction, "PRODUCER_DIGEST_UNAVAILABLE: " + e.getMessage());
-      return true;
-    }
-  }
 
-  private boolean computeAndReportSyntheticTestKey(
-      Environment env,
-      TestConfiguration configuration,
-      TestRunnerAction testAction,
-      ImmutableMap<String, String> clientEnv,
-      ProducerActionKeyContext keyContext,
-      com.google.devtools.build.lib.remote.common.RemoteCacheClient.ActionKey producerActionKey,
-      String producerMnemonic,
-      int producerInputCount,
-      long producerInputBytes,
-      long producerDigestComputeMillis,
-      InputDiscoveryState state)
-      throws InterruptedException, ActionExecutionFunctionException, UndoneInputsException {
-    long runfilesFingerprintStartNanos = BlazeClock.nanoTime();
-    Artifact runfilesMiddleman = testAction.getRunfilesMiddleman();
-    if (!(runfilesMiddleman instanceof DerivedArtifact derivedRunfilesMiddleman)) {
-      reportProducerKeyedTestCacheEligibility(
-          env, configuration, testAction, "UNSUPPORTED_RUNFILES_SHAPE");
+    Artifact runfilesTreeArtifact = testAction.getRunfilesTree();
+    if (!(runfilesTreeArtifact instanceof DerivedArtifact derivedRunfilesTree)) {
       return true;
     }
     Action runfilesAction =
@@ -647,15 +572,14 @@ public final class ActionExecutionFunction implements SkyFunction {
     }
 
     Artifact executable = testAction.getExecutionSettings().getExecutable();
-    RunfilesTree runfilesTree = middlemanAction.getRunfilesTree();
-    Map<PathFragment, Artifact> runfilesMapping = runfilesTree.getMapping();
-    ImmutableSet<Artifact> mappedRunfilesArtifacts =
-        runfilesMapping.values().stream()
-            .filter(Objects::nonNull)
-            .collect(ImmutableSet.toImmutableSet());
+    RunfilesTree runfilesTree = runfilesTreeAction.getRunfilesTree();
+    runfilesTree.fingerprint(
+        skyframeActionExecutor.getActionKeyContext(), fingerprint, /* digestAbsolutePaths= */ false);
+    ImmutableSet<Artifact> runfilesArtifacts =
+        ImmutableSet.copyOf(runfilesTree.getArtifacts().toList());
     NestedSetBuilder<Artifact> logicalArtifacts = NestedSetBuilder.stableOrder();
-    for (Artifact artifact : runfilesMapping.values()) {
-      if (artifact != null && !artifact.equals(executable)) {
+    for (Artifact artifact : runfilesArtifacts) {
+      if (!artifact.equals(executable)) {
         if (artifact.isTreeArtifact()) {
           reportProducerKeyedTestCacheEligibility(
               env, configuration, testAction, "UNSUPPORTED_RUNFILES_SHAPE: tree artifact");
@@ -666,8 +590,8 @@ public final class ActionExecutionFunction implements SkyFunction {
     }
     for (Artifact input : testAction.getInputs().toList()) {
       if (input.equals(executable)
-          || input.equals(runfilesMiddleman)
-          || mappedRunfilesArtifacts.contains(input)) {
+          || input.equals(runfilesTreeArtifact)
+          || runfilesArtifacts.contains(input)) {
         continue;
       }
       if (input.isTreeArtifact()) {
@@ -699,106 +623,28 @@ public final class ActionExecutionFunction implements SkyFunction {
       return false;
     }
 
-    ImmutableList.Builder<LogicalInput> logicalInputs = ImmutableList.builder();
-    for (Map.Entry<PathFragment, Artifact> entry : runfilesMapping.entrySet()) {
-      Artifact artifact = entry.getValue();
-      if (artifact == null) {
-        logicalInputs.add(new LogicalInput(entry.getKey().getPathString(), "empty", ""));
-      } else if (artifact.equals(executable)) {
-        logicalInputs.add(
-            new LogicalInput(
-                entry.getKey().getPathString(),
-                "producer",
-                producerActionKey.getDigest().getHash()));
-      } else {
-        FileArtifactValue metadata = logicalInputResults.actionInputMap.getInputMetadata(artifact);
-        if (metadata == null || metadata.getDigest() == null) {
-          reportProducerKeyedTestCacheEligibility(
-              env, configuration, testAction, "RUNFILES_FINGERPRINT_UNAVAILABLE");
-          return true;
-        }
-        logicalInputs.add(
-            new LogicalInput(
-                entry.getKey().getPathString(),
-                artifact.isSourceArtifact() ? "source" : "derived",
-                HexFormat.of().formatHex(metadata.getDigest()) + ":" + metadata.getSize()));
-      }
-    }
-    for (Artifact input : testAction.getInputs().toList()) {
-      if (input.equals(executable)
-          || input.equals(runfilesMiddleman)
-          || mappedRunfilesArtifacts.contains(input)) {
-        continue;
-      }
+    InputMetadataProvider logicalMetadata =
+        new ActionInputMetadataProvider(logicalInputResults.actionInputMap);
+    fingerprint.addString(
+        testAction.getKey(skyframeActionExecutor.getActionKeyContext(), logicalMetadata));
+    fingerprint.addStringMap(clientEnv);
+    testAction.getOutputs().stream()
+        .map(Artifact::getExecPathString)
+        .sorted()
+        .forEach(fingerprint::addString);
+
+    for (Artifact input :
+        artifactsToFingerprint.toList().stream()
+            .sorted(Comparator.comparing(Artifact::getExecPathString))
+            .toList()) {
       FileArtifactValue metadata = logicalInputResults.actionInputMap.getInputMetadata(input);
-      if (metadata == null || metadata.getDigest() == null) {
-        reportProducerKeyedTestCacheEligibility(
-            env, configuration, testAction, "DIRECT_INPUT_FINGERPRINT_UNAVAILABLE");
+      if (metadata == null) {
         return true;
       }
-      logicalInputs.add(
-          new LogicalInput(
-              input.getExecPathString(),
-              input.isSourceArtifact() ? "direct-source" : "direct-derived",
-              HexFormat.of().formatHex(metadata.getDigest()) + ":" + metadata.getSize()));
+      fingerprint.addString(input.getExecPathString());
+      metadata.addTo(fingerprint);
     }
-
-    ImmutableList<DeclaredOutput> declaredOutputs =
-        testAction.getOutputs().stream()
-            .map(
-                output ->
-                    new DeclaredOutput(
-                        output.getExecPathString(), output.isTreeArtifact() ? "tree" : "file"))
-            .collect(ImmutableList.toImmutableList());
-    String testActionKey =
-        testAction.getKey(
-            skyframeActionExecutor.getActionKeyContext(),
-            new ActionInputArtifactExpander(logicalInputResults.actionInputMap, ImmutableMap.of()));
-    String ownerLabel = testAction.getOwner().getLabel().getCanonicalForm();
-    String executionPlatform =
-        testAction.getOwner().getExecutionPlatform() == null
-            ? ""
-            : testAction.getOwner().getExecutionPlatform().label().getCanonicalForm();
-    long syntheticKeyStartNanos = BlazeClock.nanoTime();
-    var logicalIdentity =
-        ProducerKeyedTestIdentity.compute(
-            producerActionKey.getDigest().getHash(),
-            producerActionKey.getDigest().getSizeBytes(),
-            testActionKey,
-            ownerLabel,
-            testAction.getOwner().getConfigurationChecksum(),
-            executionPlatform,
-            clientEnv,
-            declaredOutputs,
-            logicalInputs.build());
-    var syntheticKey = keyContext.computeSyntheticTestActionKey(logicalIdentity, producerActionKey);
-    keyContext.registerSyntheticTestActionKey(
-        testAction, syntheticKey, configuration.experimentalProducerKeyedTestCacheDebug());
-    state.producerKeyedEarlyHit = keyContext.restoreSyntheticTestActionAlias(testAction);
-    long syntheticKeyComputeMillis =
-        Duration.ofNanos(BlazeClock.nanoTime() - syntheticKeyStartNanos).toMillis();
-    long runfilesFingerprintMillis =
-        Duration.ofNanos(syntheticKeyStartNanos - runfilesFingerprintStartNanos).toMillis();
-    reportProducerKeyedTestCacheEligibility(
-        env,
-        configuration,
-        testAction,
-        "eligible producer="
-            + producerMnemonic
-            + " producer_digest="
-            + producerActionKey.getDigest().getHash()
-            + " early_key="
-            + syntheticKey.actionKey().getDigest().getHash()
-            + " producer_digest_compute_ms="
-            + producerDigestComputeMillis
-            + " runfiles_fingerprint_ms="
-            + runfilesFingerprintMillis
-            + " synthetic_key_compute_ms="
-            + syntheticKeyComputeMillis
-            + " producer_input_count="
-            + producerInputCount
-            + " producer_input_bytes="
-            + producerInputBytes);
+    state.producerKeyedEarlyHit = cache.restore(testAction, fingerprint.digestAndReset());
     return true;
   }
 
@@ -1358,12 +1204,12 @@ public final class ActionExecutionFunction implements SkyFunction {
           state.token,
           clientEnv);
       if (action instanceof TestRunnerAction) {
-        ProducerActionKeyContext keyContext =
+        ProducerKeyedTestCache cache =
             skyframeActionExecutor
                 .getActionContextRegistry()
-                .getContext(ProducerActionKeyContext.class);
-        if (keyContext != null) {
-          keyContext.finalizeSyntheticTestActionAlias(action);
+                .getContext(ProducerKeyedTestCache.class);
+        if (cache != null) {
+          cache.upload(action);
         }
       }
     }
