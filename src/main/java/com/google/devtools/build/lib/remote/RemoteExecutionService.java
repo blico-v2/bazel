@@ -2180,7 +2180,11 @@ public class RemoteExecutionService {
   @Subscribe
   public void onLostInputs(LostInputsEvent event) {
     for (String digest : event.missingDigests()) {
-      knownMissingCasDigests.add(DigestUtil.fromString(digest));
+      try {
+        knownMissingCasDigests.add(DigestUtil.fromString(digest));
+      } catch (IllegalArgumentException ignored) {
+        // Some non-remote actions use opaque input identifiers instead of CAS digests.
+      }
     }
   }
 
