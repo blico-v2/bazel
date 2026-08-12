@@ -548,6 +548,7 @@ public final class ActionExecutionFunction implements SkyFunction {
     }
 
     Reset rewindPlan = null;
+    env.getListener().post(new LostInputsEvent(e.getLostInputs().keySet()));
     try {
       ActionInputDepOwners inputDepOwners =
           createAugmentedInputDepOwners(e, action, inputDepKeys, env, allInputs);
@@ -583,7 +584,6 @@ public final class ActionExecutionFunction implements SkyFunction {
               e.getFileOutErr(),
               ActionExecutedEvent.ErrorTiming.AFTER_EXECUTION);
       if (skyframeActionExecutor.invocationRetriesEnabled()) {
-        env.getListener().post(new LostInputsEvent(e.getLostInputs().keySet()));
         // The message of this exception is different, so do report.
         throw new ActionExecutionFunctionException(processedException);
       } else {
