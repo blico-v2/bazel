@@ -662,14 +662,14 @@ public class UploadManifest {
             .clearStderrRaw()
             .build();
     ByteString outputMetadataBlob = outputMetadata.toByteString();
-    Digest outputMetadataDigest = digestUtil.compute(outputMetadataBlob);
+    Digest outputMetadataDigest = digestUtil.compute(outputMetadataBlob.toByteArray());
 
     // digestToBlobs contains the original Action and Command and any Tree protos required to
     // interpret directory metadata. Add the derived Action required by REAPI UpdateActionResult,
     // the output metadata blob referenced by the synthetic result, but deliberately exclude
     // digestToFile, which contains regular outputs and stdout/stderr.
     Map<Digest, ByteString> metadataBlobs = new HashMap<>(digestToBlobs);
-    metadataBlobs.put(metadataActionKey.digest(), metadataAction.toByteString());
+    metadataBlobs.put(metadataActionKey.getDigest(), metadataAction.toByteString());
     metadataBlobs.put(outputMetadataDigest, outputMetadataBlob);
     ImmutableSet<Digest> metadataDigests = ImmutableSet.copyOf(metadataBlobs.keySet());
     ImmutableSet<Digest> missingDigests;
@@ -703,7 +703,7 @@ public class UploadManifest {
               reporter,
               context.getSpawnOwner(),
               Store.AC,
-              metadataActionKey.digest()));
+              metadataActionKey.getDigest()));
     }
     return outputMetadata;
   }

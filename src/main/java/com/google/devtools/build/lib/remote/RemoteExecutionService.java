@@ -920,7 +920,7 @@ public class RemoteExecutionService {
           ActionResult outputMetadata =
               ActionResult.parseFrom(
                   getFromFuture(
-                      combinedCache.downloadBlobAsByteString(
+                      combinedCache.downloadBlob(
                           metadataContext,
                           /* blobName= */ "metadata-only action result",
                           /* execPath= */ null,
@@ -969,7 +969,7 @@ public class RemoteExecutionService {
   }
 
   private boolean shouldUseMetadataOnlyRecord(RemoteAction action) {
-    return remoteOptions.getRemoteOutputsMode() == RemoteOutputsMode.MINIMAL
+    return remoteOptions.remoteOutputsMode == RemoteOutputsMode.MINIMAL
         && action
             .getSpawn()
             .getExecutionInfo()
