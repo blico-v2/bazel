@@ -1,9 +1,6 @@
 name: Build Linux ARM64 backport
 
-on:
-  push:
-    branches:
-      - codex/build-8.8.0-uber.1-linux-arm64
+on: workflow_dispatch
 
 permissions:
   contents: read
