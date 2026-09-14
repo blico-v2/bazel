@@ -1,0 +1,33 @@
+name: Build Linux ARM64 backport
+
+on:
+  push:
+    branches:
+      - codex/build-8.8.0-uber.1-linux-arm64
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download Bazel 8.8.0 bootstrap
+        run: |
+          curl -fL --retry 3 \
+            -o /tmp/bazel-8.8.0-linux-arm64 \
+            https://github.com/bazelbuild/bazel/releases/download/8.8.0/bazel-8.8.0-linux-arm64
+          chmod +x /tmp/bazel-8.8.0-linux-arm64
+      - name: Build patched Bazel
+        run: |
+          /tmp/bazel-8.8.0-linux-arm64 --bazelrc=/dev/null build \
+            --stamp \
+            --embed_label=8.8.0-uber.1 \
+            //src:bazel
+          cp bazel-bin/src/bazel bazel-8.8.0-uber.1-linux-arm64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bazel-8.8.0-uber.1-linux-arm64
+          path: bazel-8.8.0-uber.1-linux-arm64
+          if-no-files-found: error
