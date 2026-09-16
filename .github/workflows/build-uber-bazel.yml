@@ -1,7 +1,9 @@
 name: Build Uber Bazel 8.8.0-uber.2
 
 on:
-  workflow_dispatch:
+  push:
+    branches:
+      - codex/build-8.8.0-uber.2
 
 permissions:
   contents: read
