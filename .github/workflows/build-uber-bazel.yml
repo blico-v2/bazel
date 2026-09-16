@@ -24,7 +24,6 @@ jobs:
         run: |
           printf '%s\n' \
             'deb http://archive.debian.org/debian bullseye main' \
-            'deb http://archive.debian.org/debian-security bullseye-security main' \
             > /etc/apt/sources.list
           apt-get -o Acquire::Check-Valid-Until=false update
           apt-get install -y ca-certificates curl g++ git patch python3 unzip zip
