@@ -21,7 +21,13 @@ jobs:
     container: debian:11
     steps:
       - name: Install build tools
-        run: apt-get update && apt-get install -y ca-certificates curl g++ git patch python3 unzip zip
+        run: |
+          printf '%s\n' \
+            'deb http://archive.debian.org/debian bullseye main' \
+            'deb http://archive.debian.org/debian-security bullseye-security main' \
+            > /etc/apt/sources.list
+          apt-get -o Acquire::Check-Valid-Until=false update
+          apt-get install -y ca-certificates curl g++ git patch python3 unzip zip
       - uses: actions/checkout@v4
       - name: Download Bazel 8.8.0 bootstrap
         run: |
@@ -40,34 +46,4 @@ jobs:
         with:
           name: bazel-8.8.0-uber.2-linux-${{ matrix.arch }}
           path: bazel-8.8.0-uber.2-linux-${{ matrix.arch }}
-          if-no-files-found: error
-
-  darwin:
-    strategy:
-      matrix:
-        include:
-          - runner: macos-13
-            arch: x86_64
-          - runner: macos-14
-            arch: arm64
-    runs-on: ${{ matrix.runner }}
-    steps:
-      - uses: actions/checkout@v4
-      - name: Download Bazel 8.8.0 bootstrap
-        run: |
-          curl -fL --retry 3 \
-            -o /tmp/bazel \
-            https://github.com/bazelbuild/bazel/releases/download/8.8.0/bazel-8.8.0-darwin-${{ matrix.arch }}
-          chmod +x /tmp/bazel
-      - name: Build patched Bazel
-        run: |
-          /tmp/bazel --bazelrc=/dev/null build \
-            --stamp \
-            --embed_label=8.8.0-uber.2 \
-            //src:bazel
-          cp bazel-bin/src/bazel bazel-8.8.0-uber.2-darwin-${{ matrix.arch }}
-      - uses: actions/upload-artifact@v4
-        with:
-          name: bazel-8.8.0-uber.2-darwin-${{ matrix.arch }}
-          path: bazel-8.8.0-uber.2-darwin-${{ matrix.arch }}
           if-no-files-found: error
