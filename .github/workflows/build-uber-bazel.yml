@@ -46,3 +46,26 @@ jobs:
           name: bazel-8.8.0-uber.2-linux-${{ matrix.arch }}
           path: bazel-8.8.0-uber.2-linux-${{ matrix.arch }}
           if-no-files-found: error
+
+  darwin-x86_64:
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download Bazel 8.8.0 bootstrap
+        run: |
+          curl -fL --retry 3 \
+            -o /tmp/bazel \
+            https://github.com/bazelbuild/bazel/releases/download/8.8.0/bazel-8.8.0-darwin-x86_64
+          chmod +x /tmp/bazel
+      - name: Build patched Bazel
+        run: |
+          /tmp/bazel --bazelrc=/dev/null build \
+            --stamp \
+            --embed_label=8.8.0-uber.2 \
+            //src:bazel
+          cp bazel-bin/src/bazel bazel-8.8.0-uber.2-darwin-x86_64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bazel-8.8.0-uber.2-darwin-x86_64
+          path: bazel-8.8.0-uber.2-darwin-x86_64
+          if-no-files-found: error
