@@ -23,7 +23,8 @@ jobs:
       - name: Install build tools
         run: |
           printf '%s\n' \
-            'deb http://archive.debian.org/debian bullseye main' \
+            'deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/20260831T000000Z bullseye main' \
+            'deb [check-valid-until=no] http://snapshot.debian.org/archive/debian-security/20260831T000000Z bullseye-security main' \
             > /etc/apt/sources.list
           apt-get -o Acquire::Check-Valid-Until=false update
           apt-get install -y ca-certificates curl g++ git patch python3 unzip zip
